@@ -72,9 +72,39 @@ norm_gpu() {
 
 kv() { printf '%s=%s\n' "$1" "$(printf '%s' "${2:-unknown}" | tr '\n\r' '  ')"; }
 
+# "16.0 GT/s PCIe" -> 4
+pcie_gen() {
+  case "$1" in
+    2.5*) echo 1 ;; 5.0*|5\ *) echo 2 ;; 8.0*|8\ *) echo 3 ;; 16.0*|16\ *) echo 4 ;;
+    32.0*|32\ *) echo 5 ;; 64.0*|64\ *) echo 6 ;; *) echo "" ;;
+  esac
+}
+# pcie_of BDF - sets pcie_link (negotiated now) and pcie_max (what card and slot
+# both support) for the link into the slot. Cards with their own PCIe switch
+# (Intel Arc, some AMD) expose an internal link on the GPU function itself, so
+# walk up through bridges of the GPU's vendor to the switch's upstream port.
+pcie_of() {
+  d=$(readlink -f "/sys/bus/pci/devices/$1" 2>/dev/null) && [ -f "$d/vendor" ] || return 0
+  vendor=$(cat "$d/vendor")
+  while p=${d%/*}; [ -f "$p/class" ] && [ "$(cat "$p/vendor")" = "$vendor" ]; do
+    case $(cat "$p/class") in 0x0604*) d=$p ;; *) break ;; esac
+  done
+  p=${d%/*}
+  g=$(pcie_gen "$(cat "$d/current_link_speed" 2>/dev/null)") w=$(cat "$d/current_link_width" 2>/dev/null)
+  [ -n "$g" ] && [ -n "$w" ] && pcie_link="Gen$g x$w"
+  g=$(pcie_gen "$(cat "$d/max_link_speed" 2>/dev/null)") w=$(cat "$d/max_link_width" 2>/dev/null)
+  if [ -f "$p/max_link_speed" ]; then
+    pg=$(pcie_gen "$(cat "$p/max_link_speed")") pw=$(cat "$p/max_link_width" 2>/dev/null)
+    [ -n "$pg" ] && [ "$pg" -lt "${g:-99}" ] && g=$pg
+    [ -n "$pw" ] && [ "$pw" -lt "${w:-99}" ] && w=$pw
+  fi
+  [ -n "$g" ] && [ -n "$w" ] && pcie_max="Gen$g x$w"
+  return 0
+}
+
 # ---------------------------------------------------------------- GPU
-gpu_vendor=none gpu_model="" gpu_count=0 gpu_vram_gb="" gpu_driver="" gpu_power_limit_w=""
-if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,power.limit \
+gpu_vendor=none gpu_model="" gpu_count=0 gpu_vram_gb="" gpu_driver="" gpu_power_limit_w="" gpu_bdf=""
+if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,power.limit,pci.bus_id \
                           --format=csv,noheader,nounits 2>/dev/null) && [ -n "$q" ]; then
   gpu_vendor=nvidia
   gpu_count=$(printf '%s\n' "$q" | grep -c .)
@@ -83,11 +113,15 @@ if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_versio
   gpu_vram_gb=$(printf '%s' "$first" | cut -d, -f2 | awk '$1+0>0 {printf "%d", $1/1024+0.5}')
   gpu_driver=$(printf '%s' "$first" | cut -d, -f3 | tr -d ' ')
   gpu_power_limit_w=$(printf '%s' "$first" | cut -d, -f4 | awk '$1+0>0 {printf "%g", $1}')
+  # 00000000:01:00.0 -> 0000:01:00.0
+  gpu_bdf=$(printf '%s' "$first" | cut -d, -f5 | tr -d ' ' | tr 'A-F' 'a-f' | sed 's/^[0-9a-f]*\([0-9a-f]\{4\}:\)/\1/')
 elif have rocm-smi && rocm-smi --showproductname --json > "$tmp/rp" 2>/dev/null; then
   gpu_vendor=amd
   rocm-smi --showmeminfo vram --json > "$tmp/rm" 2>/dev/null
   rocm-smi --showdriverversion --json > "$tmp/rd" 2>/dev/null
   rocm-smi --showmaxpower --json > "$tmp/rw" 2>/dev/null
+  rocm-smi --showbus --json > "$tmp/rb" 2>/dev/null
+  gpu_bdf=$(jget "$tmp/rb" 'next(v["PCI Bus"] for k, v in j.items() if k.startswith("card")).lower()')
   gpu_count=$(jget "$tmp/rp" 'len([k for k in j if k.startswith("card")])')
   gpu_model=$(jget "$tmp/rp" '"+".join(sorted({v.get("Card Series") or v.get("Card series") or v.get("Card model", "") for k, v in j.items() if k.startswith("card")}))' | norm_gpu)
   gpu_vram_gb=$(jget "$tmp/rm" 'round(int(next(v["VRAM Total Memory (B)"] for k, v in j.items() if k.startswith("card"))) / 2**30)')
@@ -98,6 +132,7 @@ elif have xpu-smi && xpu-smi discovery -j > "$tmp/xl" 2>/dev/null; then
   gpu_count=$(jget "$tmp/xl" 'len(j["device_list"])')
   gpu_model=$(jget "$tmp/xl" '"+".join(sorted({d["device_name"] for d in j["device_list"]}))' | norm_gpu)
   dev0=$(jget "$tmp/xl" 'j["device_list"][0]["device_id"]')
+  gpu_bdf=$(jget "$tmp/xl" 'j["device_list"][0]["pci_bdf_address"].lower()')
   if [ -n "$dev0" ]; then
     xpu-smi discovery -d "$dev0" -j > "$tmp/xd" 2>/dev/null
     gpu_vram_gb=$(jget "$tmp/xd" 'round(int(j["memory_physical_size_byte"]) / 2**30)')
@@ -110,6 +145,13 @@ fi
 [ -n "$gpu_count" ] || gpu_count=unknown
 
 # ---------------------------------------------------------------- host
+# In a VM the GPU hangs off a virtual root port whose link figures are made
+# up, so PCIe is only measured on bare metal.
+virt=$(systemd-detect-virt --vm 2>/dev/null) || virt=none
+pcie_link="" pcie_max=""
+if [ "$virt" = none ] && [ -n "$gpu_bdf" ]; then pcie_of "$gpu_bdf"
+elif [ "$virt" != none ]; then pcie_link="unknown (VM)" pcie_max="unknown (VM)"; fi
+
 cpu_model=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -n1)
 [ -n "$cpu_model" ] || cpu_model=$(sed -n 's/^model name[[:space:]]*: *//p' /proc/cpuinfo 2>/dev/null | head -n1)
 ram_gb=$(awk '/^MemTotal:/ {printf "%d", $2/1048576+0.5}' /proc/meminfo 2>/dev/null)
@@ -185,10 +227,14 @@ kv gpu_count "$gpu_count"
 kv gpu_vram_gb "$gpu_vram_gb"
 kv gpu_driver "$gpu_driver"
 kv gpu_power_limit_w "$gpu_power_limit_w"
+kv gpu_bdf "$gpu_bdf"
+kv pcie_link "$pcie_link"
+kv pcie_max "$pcie_max"
 kv cpu_model "$cpu_model"
 kv ram_gb "$ram_gb"
 kv os "$os"
 kv kernel "$kernel"
+kv virt "$virt"
 kv proxy "$proxy"
 kv engine "$engine"
 kv engine_version "$engine_version"

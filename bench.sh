@@ -3,13 +3,20 @@
 #
 # usage: bench.sh --endpoint URL --model ID
 #                 --tp N --pp N --quant Q --kv KV --spec none|METHOD:N
-#                 --thinking MODE --power-limit W|stock --submitter NAME
-#                 [--api-key KEY] [--server-cmd-file FILE] [--env-file FILE]
-#                 [--results-dir DIR] [--quick] [--no-concurrency] [--dry-run]
+#                 --thinking MODE --submitter NAME
+#                 [--power-limit W|stock] [--api-key KEY] [--server-cmd-file FILE]
+#                 [--env-file FILE] [--pcie GenN xW] [--special-notes TEXT]
+#                 [--results-dir DIR] [--full] [--no-concurrency] [--dry-run]
 #
+# Default is a quick smoke run (BetterBench --quick); --full is the run that
+# counts for submission.
 # Mandatory values may also come from the environment: BENCH_TP, BENCH_PP,
-# BENCH_QUANT, BENCH_KV, BENCH_SPEC, BENCH_THINKING, BENCH_POWER_LIMIT,
-# BENCH_SUBMITTER. API key: --api-key or $BETTERBENCH_API_KEY.
+# BENCH_QUANT, BENCH_KV, BENCH_SPEC, BENCH_THINKING, BENCH_SUBMITTER.
+# --power-limit (or BENCH_POWER_LIMIT): read from the GPU when omitted; required
+# only where it can't be detected. API key: --api-key or $BETTERBENCH_API_KEY.
+# --pcie (or BENCH_PCIE): declare the slot link where it can't be read (VMs).
+# --special-notes (or BENCH_SPECIAL_NOTES): free text for anything unusual
+# about this run, e.g. "custom k8v4 kernels" or "undervolted".
 # --env-file: output of collect-env.sh run on the server, when BetterBench
 # runs on another machine (default: run collect-env.sh here).
 
@@ -21,12 +28,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 [ -f "$here/bench.local.env" ] && . "$here/bench.local.env"
 
 die() { echo "bench.sh: $*" >&2; exit 1; }
-usage() { sed -n '2,15p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,22p' "$0"; exit "${1:-0}"; }
 
-endpoint="" model="" server_cmd_file="" env_file="" quick=0 no_conc=0 dry=0
+endpoint="" model="" server_cmd_file="" env_file="" quick=1 no_conc=0 dry=0
 tp=${BENCH_TP:-} pp=${BENCH_PP:-} quant=${BENCH_QUANT:-} kv=${BENCH_KV:-}
 spec=${BENCH_SPEC:-} thinking=${BENCH_THINKING:-} power_limit=${BENCH_POWER_LIMIT:-}
-submitter=${BENCH_SUBMITTER:-}
+submitter=${BENCH_SUBMITTER:-} pcie=${BENCH_PCIE:-} special=${BENCH_SPECIAL_NOTES:-}
 results_dir=${BENCH_RESULTS_DIR:-$here/results}
 
 need() { [ "$1" -ge 2 ] || die "$2 needs a value"; }
@@ -46,7 +53,10 @@ while [ $# -gt 0 ]; do
     --thinking)        need $# "$1"; thinking=$2; shift 2 ;;
     --power-limit)     need $# "$1"; power_limit=$2; shift 2 ;;
     --submitter)       need $# "$1"; submitter=$2; shift 2 ;;
+    --pcie)            need $# "$1"; pcie=$2; shift 2 ;;
+    --special-notes)   need $# "$1"; special=$2; shift 2 ;;
     --quick)           quick=1; shift ;;
+    --full)            quick=0; shift ;;
     --no-concurrency)  no_conc=1; shift ;;
     --dry-run)         dry=1; shift ;;
     -h|--help)         usage 0 ;;
@@ -65,7 +75,7 @@ command -v python3 >/dev/null || die "python3 not found"
 command -v curl >/dev/null || die "curl not found"
 
 missing=""
-for f in endpoint model tp pp quant kv spec thinking power_limit submitter; do
+for f in endpoint model tp pp quant kv spec thinking submitter; do
   eval "v=\${$f}"
   [ -n "$v" ] || missing="$missing --$(printf '%s' "$f" | tr _ -)"
 done
@@ -77,7 +87,11 @@ matches "$spec" 'none|(mtp|eagle|eagle3|ngram|draft):[1-9][0-9]*' ||
   die "--spec must be none or METHOD:N (mtp|eagle|eagle3|ngram|draft), e.g. mtp:5"
 matches "$thinking" 'off|on|low|medium|high|default' ||
   die "--thinking must be off|on|low|medium|high|default (the server-side mode)"
-matches "$power_limit" 'stock|[0-9]+(\.[0-9]+)?' || die "--power-limit must be watts or 'stock'"
+[ -z "$power_limit" ] || matches "$power_limit" 'stock|[0-9]+(\.[0-9]+)?' ||
+  die "--power-limit must be watts or 'stock'"
+[ -z "$pcie" ] || matches "$pcie" 'Gen[1-6] x(1|2|4|8|16|32)' || die "--pcie must look like 'Gen4 x16'"
+case "$special" in *"
+"*) die "--special-notes must be a single line" ;; esac
 for f in quant kv submitter; do
   eval "v=\${$f}"
   matches "$v" '[^[:space:]=]+' || die "--$f must be one word without '='"
@@ -110,10 +124,22 @@ else
      --server-cmd-out "$tmp/cmd.auto" > "$tmp/env"
 fi
 
-# Mandatory fields first, collected ones after; one key=value per line.
+get() { sed -n "s/^$1=//p" "$tmp/env" | head -n1; }
+pl=$(get gpu_power_limit_w)
+power_src=declared
+if [ -z "$power_limit" ]; then
+  matches "$pl" '[0-9]+(\.[0-9]+)?' ||
+    die "GPU power limit not detected here; pass --power-limit W (or 'stock')"
+  power_limit=$pl power_src=detected
+fi
+
+# Raw declared values; meta.json keeps these and the collected ones as is.
 {
   printf 'submitter=%s\ntp=%s\npp=%s\nquant=%s\nkv=%s\nspec=%s\nthinking=%s\npower_limit=%s\n' \
     "$submitter" "$tp" "$pp" "$quant" "$kv" "$spec" "$thinking" "$power_limit"
+  printf 'power_limit_source=%s\n' "$power_src"
+  [ -n "$pcie" ] && printf 'pcie=%s\n' "$pcie"
+  [ -n "$special" ] && printf 'special_notes=%s\n' "$special"
   printf 'bench_standard=%s\nrun_mode=%s\nconcurrency=%s\n' "$STANDARD_VERSION" \
     "$([ $quick = 1 ] && echo quick || echo full)" "$([ $no_conc = 1 ] && echo off || echo on)"
 } > "$tmp/mandatory"
@@ -124,12 +150,76 @@ fi
 for k in $(cut -d= -f1 "$tmp/mandatory"); do
   if grep -q "^$k=" "$tmp/collected"; then die "collected env must not set mandatory key '$k'"; fi
 done
-cat "$tmp/mandatory" "$tmp/collected" > "$tmp/notes"
+# The notes are grouped for reading: one chip per topic, nothing twice.
+# The context size is left out - BetterBench shows it from --max-model-len.
+python3 - "$tmp/mandatory" "$tmp/collected" > "$tmp/notes" <<'PY'
+import sys
+def kv(path):
+    with open(path, encoding="utf-8") as f:
+        return dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
+m, c = kv(sys.argv[1]), kv(sys.argv[2])
+def g(k):
+    v = c.get(k, "")
+    return "" if v in ("", "unknown") else v
+def join(*parts):
+    return " · ".join(p for p in parts if p) or "unknown"
 
-get() { sed -n "s/^$1=//p" "$tmp/notes" | head -n1; }
-engine=$(get engine) gpu=$(get gpu_model) count=$(get gpu_count) ctx=$(get ctx) pl=$(get gpu_power_limit_w)
+vendor = {"intel": "Intel", "nvidia": "NVIDIA", "amd": "AMD"}.get(g("gpu_vendor"), g("gpu_vendor"))
+count = g("gpu_count")
+gpu = join(" ".join(p for p in (count and count + "x", vendor if vendor != "none" else "",
+                                g("gpu_model")) if p),
+           g("gpu_vram_gb") and g("gpu_vram_gb") + " GB",
+           g("gpu_driver") and "driver " + g("gpu_driver"))
+
+link, top = g("pcie_link"), g("pcie_max")
+if m.get("pcie"):
+    pcie = m["pcie"] + " (declared)"
+elif link and top and link != top:
+    pcie = f"{link} now, {top} max"   # idle GPUs drop the link speed
+else:
+    pcie = link or "unknown"
+
+pl, det = m["power_limit"], g("gpu_power_limit_w")
+if pl == "stock":
+    power = join("stock", det and det + " W")
+else:
+    power = pl + " W"
+    if det and abs(float(det) - float(pl)) > 1:
+        power += f" (GPU reports {det} W)"
+
+virt = g("virt")
+host = join(g("cpu_model"), g("ram_gb") and g("ram_gb") + " GB RAM", g("os"),
+            g("kernel") and "kernel " + g("kernel"), virt != "none" and virt and "VM " + virt)
+
+eng = g("engine")
+engine = join(" ".join(p for p in (eng, g("engine_version")) if p),
+              g("engine_slots") and g("engine_slots") + " slots",
+              g("proxy") not in ("", "none") and "via " + g("proxy"))
+
+notes = [
+    ("submitter", m["submitter"]),
+    ("gpu", gpu),
+    ("pcie", pcie),
+    ("power_limit", power),
+    ("host", host),
+    ("engine", engine),
+    ("model_file", g("model_file") or "unknown"),
+    ("parallel", f"tp {m['tp']} · pp {m['pp']}"),
+    ("precision", f"weights {m['quant']} · kv {m['kv']}"),
+    ("spec", m["spec"]),
+    ("thinking", m["thinking"]),
+    ("run", join(m["run_mode"], "concurrency " + m["concurrency"],
+                 "bench-standard " + m["bench_standard"])),
+]
+if m.get("special_notes"):
+    notes.append(("special_notes", m["special_notes"]))
+for k, v in notes:
+    print(f"{k}={v}")
+PY
+
+engine=$(get engine) gpu=$(get gpu_model) count=$(get gpu_count) ctx=$(get ctx)
 [ "$engine" != unknown ] || echo "bench.sh: warning: engine not detected; result is hard to compare" >&2
-if [ "$power_limit" != stock ] && matches "$pl" '[0-9.]+' &&
+if [ "$power_src" = declared ] && [ "$power_limit" != stock ] && matches "$pl" '[0-9.]+' &&
    [ "$(awk -v a="$pl" -v b="$power_limit" 'BEGIN{print (a-b>1||b-a>1)}')" = 1 ]; then
   echo "bench.sh: warning: --power-limit $power_limit W but the GPU reports $pl W" >&2
 fi
@@ -173,7 +263,7 @@ open(sys.argv[2], "w", encoding="utf-8").write(s if s.endswith("\n") else s + "\
 PY
 fi
 
-STANDARD_VERSION=$STANDARD_VERSION CMD_SRC=$cmd_src ENDPOINT=$endpoint MODEL=$model NAME=$name \
+STANDARD_VERSION=$STANDARD_VERSION CMD_SRC=$cmd_src ENDPOINT=$endpoint MODEL=$model NAME=$name NOTES=$tmp/notes \
 python3 - "$tmp/mandatory" "$tmp/collected" "$run_dir/meta.json" "$@" <<'PY'
 import json, os, sys, time
 def kv(path):
@@ -186,6 +276,7 @@ meta = {
     "endpoint": os.environ["ENDPOINT"],
     "model": os.environ["MODEL"],
     "name": os.environ["NAME"],
+    "notes": kv(os.environ["NOTES"]),
     "mandatory": kv(sys.argv[1]),
     "collected": kv(sys.argv[2]),
     "server_cmd_file": "server-cmd.txt" if src else None,

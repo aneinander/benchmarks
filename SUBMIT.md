@@ -9,7 +9,8 @@ Send the whole run directory `results/<timestamp>-<submitter>-<model>-<engine>-<
 | `meta.json` | detected + declared setup, the exact BetterBench command |
 | `server-cmd.txt` | the server launch command (from `--server-cmd-file`, or from llama-swap) |
 
-Only full runs count: `run_mode=full` in `meta.json`. Quick runs are smoke tests.
+Only full runs count (`bench.sh --full`): the `run` note starts with `full`. Runs
+without `--full` are quick smoke tests.
 
 If `server-cmd.txt` is missing, pass `--server-cmd-file` next time, or add the launch
 command by hand. Values of variables or flags named like `*TOKEN*`, `*KEY*`, `*SECRET*`,
