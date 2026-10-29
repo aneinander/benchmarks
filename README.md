@@ -6,8 +6,23 @@ It runs the benchmark and records the setup the numbers were measured on: GPU,
 PCIe, power, engine and version, launch flags, env flags, memory bandwidth and
 more. Two results can only be compared when you know how they differ.
 
-Using a coding agent? Hand it [`AGENTS.md`](AGENTS.md). It's a step-by-step procedure
-it can follow.
+## With a coding agent
+
+Copy this into Claude Code, Codex, Cursor or any agent that can run commands on the
+machine with your GPU:
+
+```text
+Help me benchmark my LLM server with bench-standard. Read these two files first:
+https://git.linxweiler.xyz/miga/benchmarks/raw/branch/main/AGENTS.md
+https://git.linxweiler.xyz/miga/benchmarks/raw/branch/main/README.md
+Then follow AGENTS.md step by step: install what's missing, find my server and model,
+check the model hash, work out the values to declare from my server's launch command,
+and do a dry run and a quick run. Ask me for anything you can't find out yourself,
+and ask me before the --full run.
+```
+
+The agent follows [`AGENTS.md`](AGENTS.md), a step-by-step procedure with rules that keep
+the result valid. Without an agent, do it yourself as described below.
 
 ## Quick start
 
