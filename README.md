@@ -215,7 +215,7 @@ during the benchmark if you want it.
 `bench.sh` is generated: the sources are in [`dev/`](dev/), and `sh dev/build.sh` packs
 them into the one file. Commit `dev/` and the rebuilt `bench.sh` together.
 
-The source repo is [git.linxweiler.xyz/miga/benchmarks](https://git.linxweiler.xyz/miga/benchmarks).
-Push there. [GitHub](https://github.com/aneinander/benchmarks) is a mirror that Gitea
-updates on every push, so don't push to GitHub directly. What each
+Bugs and ideas: open an issue on [GitHub](https://github.com/aneinander/benchmarks/issues).
+The GitHub repo is a mirror, updated automatically from the maintainers' source repo.
+Changes are made there, and anything pushed or merged on GitHub directly gets overwritten. What each
 recorded value means and how it's detected: [`dev/DETAILS.md`](dev/DETAILS.md).
