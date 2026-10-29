@@ -4,15 +4,18 @@
 # Never aborts on detection: anything it cannot find is reported as "unknown".
 #
 # usage: collect-env.sh [--endpoint URL] [--model ID] [--api-key KEY] [--server-cmd-out FILE]
+#                       [--server-cmd-file FILE]
 #   --endpoint        OpenAI-compatible base, e.g. http://localhost:8080/v1 (omit: hardware only)
 #   --model           model id as sent to the endpoint (needed behind llama-swap)
 #   --server-cmd-out  behind llama-swap: write the model's launch command (raw) to FILE
-# env: BETTERBENCH_API_KEY, PROBE_TIMEOUT (s, default 10), LOAD_TIMEOUT (s, default 600)
+#   --server-cmd-file the launch command when not behind llama-swap (finds the container)
+# env: BETTERBENCH_API_KEY, PROBE_TIMEOUT (s, default 10), LOAD_TIMEOUT (s, default 600),
+#      MEASURE_BW=0 (skip the bandwidth test), BW_PYTHON (python with torch for it)
 
 set -u
 LC_ALL=C; export LC_ALL
 
-endpoint="" model="" api_key="${BETTERBENCH_API_KEY:-}" cmd_out=""
+endpoint="" model="" api_key="${BETTERBENCH_API_KEY:-}" cmd_out="" cmd_file=""
 PROBE_TIMEOUT=${PROBE_TIMEOUT:-10}
 LOAD_TIMEOUT=${LOAD_TIMEOUT:-600}
 
@@ -23,7 +26,8 @@ while [ $# -gt 0 ]; do
     --model)          need $# "$1"; model=$2; shift 2 ;;
     --api-key)        need $# "$1"; api_key=$2; shift 2 ;;
     --server-cmd-out) need $# "$1"; cmd_out=$2; shift 2 ;;
-    -h|--help)        sed -n '2,10p' "$0"; exit 0 ;;
+    --server-cmd-file) need $# "$1"; cmd_file=$2; shift 2 ;;
+    -h|--help)        sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "collect-env: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -152,6 +156,30 @@ pcie_link="" pcie_max=""
 if [ "$virt" = none ] && [ -n "$gpu_bdf" ]; then pcie_of "$gpu_bdf"
 elif [ "$virt" != none ]; then pcie_link="unknown (VM)" pcie_max="unknown (VM)"; fi
 
+# Largest BAR of the GPU function: about VRAM-sized with Resizable BAR on,
+# 256 MiB or less when off - the rule BetterBench's own fingerprint uses
+# (GGZ14/BetterBench#4). Passthrough keeps BAR sizes, so this holds in a VM too.
+gpu_bar_mib="" rebar=""
+if [ -n "$gpu_bdf" ] && [ -r "/sys/bus/pci/devices/$gpu_bdf/resource" ] && have python3; then
+  gpu_bar_mib=$(python3 - "/sys/bus/pci/devices/$gpu_bdf/resource" <<'PY' 2>/dev/null
+import sys
+bars = []
+for line in open(sys.argv[1]):
+    try:
+        start, end, _ = (int(x, 16) for x in line.split())
+    except ValueError:
+        continue
+    if end > start:
+        bars.append((end - start + 1) >> 20)
+if bars:
+    print(max(bars))
+PY
+)
+  if [ -n "$gpu_bar_mib" ]; then
+    if [ "$gpu_bar_mib" -gt 256 ]; then rebar=on; else rebar=off; fi
+  fi
+fi
+
 cpu_model=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -n1)
 [ -n "$cpu_model" ] || cpu_model=$(sed -n 's/^model name[[:space:]]*: *//p' /proc/cpuinfo 2>/dev/null | head -n1)
 ram_gb=$(awk '/^MemTotal:/ {printf "%d", $2/1048576+0.5}' /proc/meminfo 2>/dev/null)
@@ -221,6 +249,61 @@ PY
   fi
 fi
 
+# Weight bytes as stored: a single file, the parts of a split GGUF
+# (-00001-of-0000N.gguf), or the *.safetensors of a model directory.
+model_bytes=""
+if [ -f "$model_file" ]; then
+  case $model_file in
+    *-00001-of-[0-9]*.gguf) set -- "${model_file%-00001-of-*}"-[0-9]*-of-[0-9]*.gguf ;;
+    *) set -- "$model_file" ;;
+  esac
+  model_bytes=$(stat -c %s "$@" 2>/dev/null | awk '{s += $1} END {if (s) printf "%d", s}')
+elif [ -d "$model_file" ]; then
+  model_bytes=$(find "$model_file" -maxdepth 1 -name '*.safetensors' -exec stat -c %s {} + 2>/dev/null |
+                awk '{s += $1} END {if (s) printf "%d", s}')
+fi
+
+[ -s "$tmp/cmd" ] || { [ -n "$cmd_file" ] && cp "$cmd_file" "$tmp/cmd" 2>/dev/null; }
+# A docker server: the exact image, since tags like llama.cpp's server-intel
+# move daily (the llama.cpp build itself is in engine_version).
+container="" engine_image=""
+[ -s "$tmp/cmd" ] && container=$(tr '\n' ' ' < "$tmp/cmd" |
+  sed -n 's/.*docker  *\(run\|create\) .*--name[= ]\([^ ]*\).*/\2/p')
+if [ -n "$container" ] && have docker &&
+   i=$(docker inspect -f '{{.Config.Image}}@{{.Image}}' "$container" 2>/dev/null); then
+  engine_image=$(printf '%s' "$i" | sed 's/@sha256:\(.\{12\}\).*/@\1/')
+fi
+
+# Measured memory bandwidth, the base for "% of peak". mem-bw.py copies random
+# data with torch, inside the server's container (same GPU, env and torch), or
+# with $BW_PYTHON. Fallback: clpeak, whose test data may compress on Arc and
+# read high. A few seconds and 2 GiB of free VRAM; MEASURE_BW=0 skips it.
+gpu_mem_bw_gbs="" gpu_mem_bw_tool=""
+here=$(cd "$(dirname "$0")" && pwd)
+if [ "${MEASURE_BW:-1}" != 0 ]; then
+  if [ -n "${BW_PYTHON:-}" ]; then
+    r=$(timeout 300 "$BW_PYTHON" "$here/mem-bw.py" 2>/dev/null)
+  elif [ -n "$engine_image" ]; then
+    r=$(timeout 300 docker exec -i "$container" python3 - < "$here/mem-bw.py" 2>/dev/null)
+  else
+    r=""
+  fi
+  if [ -n "$r" ]; then
+    gpu_mem_bw_gbs=${r% *} gpu_mem_bw_tool="torch copy, random, ${r#* } MiB"
+  elif have clpeak && [ -n "$gpu_model" ]; then
+    echo "collect-env: measuring memory bandwidth with clpeak (MEASURE_BW=0 skips) ..." >&2
+    timeout 300 clpeak --global-bandwidth > "$tmp/clpeak" 2>/dev/null
+    # Pick the device whose name holds the detected model; take the best width.
+    gpu_mem_bw_gbs=$(awk -v want="$gpu_model" '
+      /^ *Device:/ { sub(/^ *Device: */, ""); gsub(/\([RT]M*\)/, ""); gsub(/  +/, " "); dev = $0; next }
+      /Global memory bandwidth/ { inbw = index(dev, want) > 0; next }
+      inbw && /^ *float[0-9]* *:/ { v = $NF + 0; if (v > best) best = v; next }
+      inbw && !/^ *float/ { inbw = 0 }
+      END { if (best > 0) printf "%.0f", best }' "$tmp/clpeak")
+    [ -n "$gpu_mem_bw_gbs" ] && gpu_mem_bw_tool=clpeak
+  fi
+fi
+
 kv gpu_vendor "$gpu_vendor"
 kv gpu_model "$gpu_model"
 kv gpu_count "$gpu_count"
@@ -230,6 +313,10 @@ kv gpu_power_limit_w "$gpu_power_limit_w"
 kv gpu_bdf "$gpu_bdf"
 kv pcie_link "$pcie_link"
 kv pcie_max "$pcie_max"
+kv gpu_bar_mib "$gpu_bar_mib"
+kv rebar "$rebar"
+kv gpu_mem_bw_gbs "$gpu_mem_bw_gbs"
+kv gpu_mem_bw_tool "$gpu_mem_bw_tool"
 kv cpu_model "$cpu_model"
 kv ram_gb "$ram_gb"
 kv os "$os"
@@ -239,6 +326,8 @@ kv proxy "$proxy"
 kv engine "$engine"
 kv engine_version "$engine_version"
 kv engine_slots "$engine_slots"
+kv engine_image "$engine_image"
 kv model_file "$model_file"
+kv model_bytes "$model_bytes"
 kv ctx "$ctx"
 exit 0

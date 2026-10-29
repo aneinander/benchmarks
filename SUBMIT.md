@@ -8,6 +8,8 @@ Send the whole run directory `results/<timestamp>-<submitter>-<model>-<engine>-<
 | `results.html` | the standalone report |
 | `meta.json` | detected + declared setup, the exact BetterBench command |
 | `server-cmd.txt` | the server launch command (from `--server-cmd-file`, or from llama-swap) |
+| `power.csv` | GPU samples during the run (`epoch_s,watts,joules,mhz`), when measured |
+| `betterbench.log` | BetterBench's full terminal output |
 
 Only full runs count (`bench.sh --full`): the `run` note starts with `full`. Runs
 without `--full` are quick smoke tests.
