@@ -13,8 +13,8 @@ machine with your GPU:
 
 ```text
 Help me benchmark my LLM server with bench-standard. Read these two files first:
-https://git.linxweiler.xyz/miga/benchmarks/raw/branch/main/AGENTS.md
-https://git.linxweiler.xyz/miga/benchmarks/raw/branch/main/README.md
+https://raw.githubusercontent.com/aneinander/benchmarks/main/AGENTS.md
+https://raw.githubusercontent.com/aneinander/benchmarks/main/README.md
 Then follow AGENTS.md step by step: install what's missing, find my server and model,
 check the model hash, work out the values to declare from my server's launch command,
 and do a dry run and a quick run. Ask me for anything you can't find out yourself,
