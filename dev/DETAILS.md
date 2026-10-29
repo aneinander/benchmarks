@@ -14,10 +14,13 @@ What `bench.sh` records, how, and how it's built. For running it, see
 
 ## Files in a run folder
 
+`<run>` is the folder's name, `<YYMMDD>_<submitter>_<model>_<engine>_<N>x-<gpu>[_quick][_2]`
+with `N` = tp × pp; see the README.
+
 | file | what |
 |---|---|
-| `results.json` | BetterBench results; the notes below are under `env.notes` |
-| `results.html` | the standalone report |
+| `<run>.json` | BetterBench results; the notes below are under `env.notes` |
+| `<run>.html` | the standalone report |
 | `config.json` | the BetterBench config the run used |
 | `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run` |
 | `server-cmd.txt` | the server launch command, secrets redacted |
@@ -117,7 +120,7 @@ fixed before BetterBench starts.
   `timeline.tsv`, and a piece of work lasts until the next line. That gives joules and
   average W for decode (J per output token), prefill (J per 1000 prompt tokens) and each
   concurrency level (J per token). The warm-up passes draw power but aren't in
-  `results.json`, so their tokens are estimated from the measured passes of the same
+  the results, so their tokens are estimated from the measured passes of the same
   piece (`tokens_incl_warmup_est`). These compare across quick and full runs; the
   whole-run figure doesn't.
 - **roofline:** median batch-1 decode t/s × weight bytes ÷ memory bandwidth = % of

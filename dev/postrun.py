@@ -1,9 +1,10 @@
 """postrun.py - figures that need the finished run, and the summary.
 
-usage: T0=epoch T1=epoch postrun.py RUN_DIR
+usage: T0=epoch T1=epoch postrun.py RUN_DIR [RESULTS_JSON]
 
-Reads results.json, meta.json, power.csv (epoch_s,watts,joules,mhz) and
-timeline.tsv (epoch<TAB>BetterBench progress line) from RUN_DIR. Writes
+Reads RESULTS_JSON (default RUN_DIR/results.json), and meta.json, power.csv
+(epoch_s,watts,joules,mhz) and timeline.tsv (epoch<TAB>BetterBench progress
+line) from RUN_DIR. Writes
 energy (whole run and per phase) and the bandwidth figure to meta.json under
 "post_run", and prints the summary to stderr.
 """
@@ -78,7 +79,7 @@ def segments(timeline, t_end):
 
 def phase_energy(res, rows, timeline, t_end):
     """Joules and joules per token for decode, prefill and each concurrency
-    level. Warm-up passes draw power but aren't in results.json, so their
+    level. Warm-up passes draw power but aren't in the results, so their
     tokens are estimated from the measured passes of the same piece."""
     ts, cum, _ = energy_curve(rows)
     single = res.get("single_stream") or {}
@@ -146,8 +147,8 @@ def roofline(single, c, m):
             "pct_of_mem_bw": round(100 * eff / (bw * tp), 1)}
 
 
-def main(d):
-    res = json.load(open(f"{d}/results.json", encoding="utf-8"))
+def main(d, results=None):
+    res = json.load(open(results or f"{d}/results.json", encoding="utf-8"))
     meta = json.load(open(f"{d}/meta.json", encoding="utf-8"))
     c, m = meta["collected"], meta["mandatory"]
     t0, t1 = float(os.environ["T0"]), float(os.environ["T1"])
@@ -242,4 +243,4 @@ def main(d):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(*sys.argv[1:3])

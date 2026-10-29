@@ -142,7 +142,7 @@ file next to `bench.sh`.
    bandwidth reached, average power and clock, and energy: J per token for decode and
    each concurrency level, J per 1000 tokens for prefill.
 
-Everything is recorded as notes in `results.json`, so it shows in the report and in
+Everything is recorded as notes in the results `.json`, so it shows in the report and in
 `compare`. Example notes:
 
 ```
@@ -160,12 +160,22 @@ run          full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1
 
 ## Your result
 
-Each run makes a folder `results/<date>-<you>-<model>-<engine>-<gpu>/`:
+Each run makes a folder `results/<run>/`, and the report and results inside it carry the
+same name, so they still say what they are when sent on their own:
+
+```text
+<YYMMDD>_<you>_<model>_<engine>_<N>x-<gpu>[_quick][_2]
+261029_pascal_qwen3.5-9b_llama.cpp_1x-intel-arc-pro-b65
+```
+
+`N` is the number of GPUs the model runs on (`--tp` × `--pp`). Fields are separated by
+`_`, words within a field by `-`. Quick runs end in `_quick`. Another run of the same
+setup on the same day gets `_2`, `_3`, ...
 
 | file | what |
 |---|---|
-| `results.html` | the report; open it in a browser |
-| `results.json` | the results, with all notes |
+| `<run>.html` | the report; open it in a browser |
+| `<run>.json` | the results, with all notes |
 | `meta.json` | every raw value, plus energy and % of bandwidth |
 | `server-cmd.txt` | your server's launch command, secrets redacted |
 | `config.json`, `power.csv`, `timeline.tsv`, `betterbench.log` | the config used, power samples, when each phase ran, the full output |
@@ -176,7 +186,7 @@ first. Tokens, keys and passwords are redacted automatically.
 Compare two runs:
 
 ```sh
-betterbench compare A/results.json B/results.json
+betterbench compare A/A.json B/B.json
 ```
 
 Every recorded difference shows up as a mismatch chip, so you can see exactly what

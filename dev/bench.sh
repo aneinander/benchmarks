@@ -267,21 +267,32 @@ fi
 python3 "$here/notes.py" "$tmp/mandatory" "$tmp/collected" "$tmp/measured" "$tmp/cmd.red" \
   "$tmp/launch.json" "$here/models.tsv" > "$tmp/notes"
 
-engine=$(get engine) gpu=$(get gpu_model) count=$(get gpu_count) ctx=$(get ctx)
+engine=$(get engine) gpu=$(get gpu_model) ctx=$(get ctx)
 [ "$engine" != unknown ] || echo "bench.sh: warning: engine not detected; result is hard to compare" >&2
 if [ "$power_src" = declared ] && [ "$power_limit" != stock ] && matches "$pl" '[0-9.]+' &&
    [ "$(awk -v a="$pl" -v b="$power_limit" 'BEGIN{print (a-b>1||b-a>1)}')" = 1 ]; then
   echo "bench.sh: warning: --power-limit $power_limit W but the GPU reports $pl W" >&2
 fi
-matches "$count" '[2-9]|[1-9][0-9]+' && gpu="${count}x-$gpu"
+# File names: <YYMMDD>_<submitter>_<model>_<engine>_<N>x-<gpu>[_quick][_2],
+# with N the GPUs the model runs on (tp x pp); _2, _3, ... for another run of
+# the same setup on the same day. Fields are joined with _ since
+# model names have dashes. The run folder and the exported results.json/.html
+# are named alike, so a file sent on its own still says what it is.
 slug() { tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9.]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'; }
-name=$(printf '%s-%s-%s' "$model" "$engine" "$gpu" | slug)
-
-run_dir="$results_dir/$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$submitter" | slug)-$name"
+gpu=$(printf '%s' "$gpu" | slug)
+name="$(printf '%s' "$model" | slug)_$(printf '%s' "$engine" | slug)_$((tp * pp))x-${gpu:-unknown}"
+run_id="$(date +%y%m%d)_$(printf '%s' "$submitter" | slug)_$name"
+[ $quick = 1 ] && run_id="${run_id}_quick"
+base=$run_id i=1
+while [ -e "$results_dir/$run_id" ] || [ -e "$results_dir/$run_id.failed" ]; do
+  i=$((i + 1)); run_id="${base}_$i"
+done
+run_dir="$results_dir/$run_id"
+results="$run_dir/$run_id.json"
 
 # ---------------------------------------------------------------- run
 set -- run --no-update-check --endpoint "$endpoint" --model "$model" \
-       --config "$run_dir/config.json" --name "$name" --out "$run_dir/results.json"
+       --config "$run_dir/config.json" --name "$name" --out "$results"
 [ $quick = 1 ] && set -- "$@" --quick
 [ $no_conc = 1 ] && set -- "$@" --no-concurrency
 # Through a proxy /v1/models often lacks the context size; hand over what the
@@ -364,14 +375,14 @@ fi
 
 # Energy (whole run and per phase) and decode as % of memory bandwidth, from
 # what the run measured. They come after the run, so they go to meta.json
-# ("post_run"), not into the notes of results.json.
-T0=$t_start T1=$t_end python3 "$here/postrun.py" "$run_dir" ||
+# ("post_run"), not into the notes of the results file.
+T0=$t_start T1=$t_end python3 "$here/postrun.py" "$run_dir" "$results" ||
   echo "bench.sh: warning: post-run figures failed" >&2
 
 # BetterBench with GGZ14/BetterBench#4 fingerprints PCIe and BAR itself
 # (env.gpu.pci), on the machine BetterBench runs on. Say so when that is not
 # the benchmarked GPU, or when it disagrees with collect-env.sh.
-ENV_FILE=$env_file python3 - "$run_dir/results.json" "$tmp/collected" <<'PY' || true
+ENV_FILE=$env_file python3 - "$results" "$tmp/collected" <<'PY' || true
 import json, os, sys
 pci = ((json.load(open(sys.argv[1], encoding="utf-8")).get("env") or {}).get("gpu") or {}).get("pci")
 if not pci:
