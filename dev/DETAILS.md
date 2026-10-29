@@ -1,14 +1,15 @@
 # Details
 
-What `bench.sh` records, and how. For running it, see [`README.md`](README.md).
+What `bench.sh` records, how, and how it's built. For running it, see
+[`AGENTS.md`](../AGENTS.md) or `./bench.sh --help`.
 
 ## What a run does
 
 1. One warm-up request. Behind llama-swap the first request loads the model, which
    can take minutes.
 2. **Greedy check:** the same prompt 3 times at temperature 0.
-3. `collect-env.sh` detects the hardware and the engine, and measures memory bandwidth.
-4. BetterBench runs while `gpu-power.sh` samples power, energy and clock every 2 s.
+3. `collect-env.sh` (also `bench.sh collect-env`) detects the hardware and the engine, and measures memory bandwidth.
+4. BetterBench runs while `gpu-power.sh` (also `bench.sh power`) samples power, energy and clock every 2 s.
 5. A summary prints. Energy and % of bandwidth are written to `meta.json`.
 
 ## Files in a run folder
@@ -17,6 +18,7 @@ What `bench.sh` records, and how. For running it, see [`README.md`](README.md).
 |---|---|
 | `results.json` | BetterBench results; the notes below are under `env.notes` |
 | `results.html` | the standalone report |
+| `config.json` | the BetterBench config the run used |
 | `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run` |
 | `server-cmd.txt` | the server launch command, secrets redacted |
 | `power.csv` | `epoch_s,watts,joules,mhz` during the run |
@@ -43,7 +45,7 @@ can't be detected is left out or shows `unknown`.
 | `env_flags` | `GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1`, or `none` |
 | `spec`, `thinking` | `mtp:5`, `default` |
 | `greedy_check` | `identical 3/3 · 1d5105fe09dc`, `differs: 2 variants in 3 · first ...` |
-| `run` | `full · concurrency on · bench-standard 0.3.0` |
+| `run` | `full · concurrency on · bench-standard 0.4.0 · betterbench 0.6.1` |
 | `special_notes` | only when given |
 
 The context size appears as BetterBench's own chip.
@@ -54,7 +56,7 @@ The context size appears as BetterBench's own chip.
 
 **PCIe** is the link into the slot. Cards with their own PCIe switch (Intel Arc, some AMD)
 are read at the switch's upstream port. Inside a VM the link can't be read: run
-`collect-env.sh` on the hypervisor, or pass `--pcie`.
+`bench.sh collect-env` on the hypervisor, or pass `--pcie`.
 
 **ReBAR** is on when the GPU's largest BAR is bigger than 256 MiB (about the size of VRAM).
 This works in a VM too, because passthrough keeps BAR sizes.
@@ -93,7 +95,7 @@ fixed before BetterBench starts.
   The clock counts only samples where the GPU is running. The figures cover the
   **whole run**, warm-up and prefill included, so compare only runs of the same mode.
   Power is sampled only when BetterBench runs on the server. On a split setup, run
-  `gpu-power.sh > power.csv` on the server yourself.
+  `bench.sh power > power.csv` on the server yourself.
 - **roofline:** median batch-1 decode t/s × weight bytes ÷ memory bandwidth = % of
   bandwidth. It holds for dense models. Spec decoding and MoE can exceed 100%. So
   can models quantized at load (e.g. vLLM fp8 from bf16 files), because they read
@@ -107,3 +109,22 @@ own GPU/PCIe/ReBAR probe under `env.gpu` (still version 0.6.1). That probe descr
 machine BetterBench runs on, so the notes above are what count. `bench.sh` warns when
 the two disagree. The probe adds an `intel`-style chip, so `compare` shows a `gpu`
 mismatch between runs with and without the PR.
+
+## Building
+
+People download only the root `bench.sh`. It's generated: `dev/build.sh` packs
+`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `config.json` and
+`standard.env` into it. At run time it unpacks them to a temp dir and runs
+`dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
+and `bench.local.env` stay next to the downloaded file.
+
+```sh
+sh dev/build.sh            # after any change in dev/; commit dev/ and bench.sh together
+sh dev/build.sh --check    # fails if bench.sh is out of date
+sh dev/bench.sh --help     # dev/bench.sh also runs directly, results in dev/results/
+```
+
+BetterBench 0.6.1 is the oldest version that works (`BETTERBENCH_MIN_VERSION` in
+`standard.env`). Newer ones run too, and their version goes into the `run` note.
+Bump `STANDARD_VERSION` when `config.json`, the minimum BetterBench or the recorded
+fields change.
