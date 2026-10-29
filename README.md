@@ -15,7 +15,7 @@ On the machine with the GPU and the inference server (Linux, Python 3.10+):
 
 ```sh
 pip install git+https://github.com/GGZ14/BetterBench   # BetterBench 0.6.1 or newer
-curl -O https://git.linxweiler.xyz/miga/benchmarks/raw/branch/main/bench.sh && chmod +x bench.sh
+curl -O https://raw.githubusercontent.com/aneinander/benchmarks/main/bench.sh && chmod +x bench.sh
 ```
 
 Serve one of the [models](#models) with any OpenAI-compatible server (llama.cpp, vLLM,
