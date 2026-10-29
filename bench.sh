@@ -54,7 +54,7 @@ cat > "$d/bench.sh" <<'__BENCH_STANDARD_EOF__'
 # BENCH_PCIE, BENCH_MEM_BW, BENCH_SPECIAL_NOTES, BENCH_RESULTS_DIR. Machine-
 # local defaults like these go in bench.local.env next to bench.sh.
 # Send the whole results/<run>/ folder. Only --full runs count.
-# The standard models, their hashes and step-by-step help: AGENTS.md.
+# The standard models and their hashes: README.md. For agents: AGENTS.md.
 
 set -eu
 umask 002
