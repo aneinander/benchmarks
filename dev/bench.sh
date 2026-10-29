@@ -161,6 +161,7 @@ case "$code" in 2*) ;; *) die "warm-up request failed (HTTP $code): $(head -c 30
 # The same prompt three times at temperature 0 must give the same text. The
 # hash of that text also lets two setups of the same model be compared: a
 # different hash means different numerics (quant, kernels, spec decoding bug).
+# Whether the replies hold reasoning is checked against --thinking below.
 echo "greedy check: 3 requests at temperature 0 ..." >&2
 ENDPOINT=$endpoint MODEL=$model python3 - > "$tmp/measured" <<'PY'
 import hashlib, json, os, urllib.request
@@ -172,7 +173,7 @@ body = json.dumps({"model": os.environ["MODEL"], "temperature": 0, "seed": 0,
 hdr = {"Content-Type": "application/json"}
 if os.environ.get("BETTERBENCH_API_KEY"):
     hdr["Authorization"] = "Bearer " + os.environ["BETTERBENCH_API_KEY"]
-outs = []
+outs, thought = [], []
 try:
     for _ in range(3):
         req = urllib.request.Request(os.environ["ENDPOINT"].rstrip("/") + "/chat/completions",
@@ -180,8 +181,12 @@ try:
         with urllib.request.urlopen(req, timeout=600) as r:
             msg = json.load(r)["choices"][0]["message"]
         # thinking models may spend all 128 tokens on reasoning
-        outs.append((msg.get("reasoning_content") or msg.get("reasoning") or "") +
-                    "\0" + (msg.get("content") or ""))
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        content = msg.get("content") or ""
+        outs.append(reasoning + "\0" + content)
+        # a separate reasoning field (server with a reasoning parser), or
+        # think tags left in the text (server without one)
+        thought.append(bool(reasoning.strip()) or "</think>" in content or "<think>" in content)
 except Exception as e:
     print("greedy_check=failed")
     print("greedy_error=" + " ".join(str(e).split())[:200])
@@ -189,6 +194,7 @@ else:
     hashes = [hashlib.sha256(o.encode()).hexdigest()[:12] for o in outs]
     print("greedy_check=" + ("identical" if len(set(hashes)) == 1 else "differs"))
     print(f"greedy_variants={len(set(hashes))}\ngreedy_runs={len(hashes)}\ngreedy_hash={hashes[0]}")
+    print("greedy_reasoning=" + ("yes" if all(thought) else "no" if not any(thought) else "mixed"))
 PY
 
 # ---------------------------------------------------------------- collect
@@ -401,6 +407,18 @@ elif meas.get("greedy_check") == "differs":
 else:
     greedy = "failed"
 
+# --thinking is declared, but the greedy replies show whether the model
+# reasoned: check one against the other.
+seen = meas.get("greedy_reasoning")
+thinking = join(m["thinking"], {"yes": "reasoning seen", "no": "no reasoning seen",
+                                "mixed": "reasoning in some replies"}.get(seen, ""))
+if m["thinking"] == "off" and seen in ("yes", "mixed"):
+    print("bench.sh: warning: --thinking off, but the greedy replies contain reasoning;"
+          " check the server's chat template or reasoning flags", file=sys.stderr)
+elif m["thinking"] in ("on", "low", "medium", "high") and seen == "no":
+    print(f"bench.sh: warning: --thinking {m['thinking']}, but the greedy replies contain no"
+          " reasoning; thinking may be off on the server", file=sys.stderr)
+
 eng = g("engine")
 engine = join(" ".join(p for p in (eng, g("engine_version")) if p),
               g("engine_slots") and g("engine_slots") + " slots",
@@ -421,7 +439,7 @@ notes = [
     ("launch", launch),
     ("env_flags", env_flags),
     ("spec", m["spec"]),
-    ("thinking", m["thinking"]),
+    ("thinking", thinking),
     ("greedy_check", greedy),
     ("run", join(m["run_mode"], "concurrency " + m["concurrency"],
                  "bench-standard " + m["bench_standard"], "betterbench " + m["betterbench"])),

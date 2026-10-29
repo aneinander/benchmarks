@@ -113,6 +113,7 @@ Tell your human:
 | `GPU power limit not detected here` | ask for the limit, pass `--power-limit W` or `stock` |
 | `--kv X but the launch command sets Y` | the declared `--kv` is wrong. Use what the command sets |
 | `greedy_check=differs` | not a failure, but report it. It means nondeterministic kernels or a broken spec-decoding path |
+| `--thinking X, but the greedy replies ...` | the declared thinking mode doesn't match what the server does. Ask your human which is right; never change the server yourself |
 | `mem_bw` has no measured figure | no torch in the server container. Set `BW_PYTHON` to a python with GPU torch, or install `clpeak`, or leave it |
 | `launch=unknown (pass --server-cmd-file)` | step 3 |
 | `betterbench failed (exit N)` | read `betterbench.log` in the `.failed` folder. Usually the server crashed or ran out of memory |

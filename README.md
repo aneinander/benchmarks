@@ -128,7 +128,8 @@ file next to `bench.sh`.
 1. **Warm-up:** one request. Behind llama-swap that loads the model, which can take minutes.
 2. **Greedy check:** the same prompt 3 times at temperature 0. The output should be
    identical. Its hash lets you compare setups: the same model and quant should give
-   the same text everywhere.
+   the same text everywhere. The replies also show whether the model reasoned, and
+   `bench.sh` warns if that contradicts your `--thinking`.
 3. **Detection:** GPU, driver, power limit, PCIe link and ReBAR, CPU, RAM, OS, the
    engine and its exact build, the docker image, the model file and size, launch and
    env flags. **Memory bandwidth** is measured with random data inside the server's
@@ -149,7 +150,8 @@ launch       b 4096 · ub 1024 · fa on · ctk q8_0 · ctv q8_0 · ngl 99 · np 
 env_flags    GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1
 mem_bw       532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared
 greedy_check identical 3/3 · 1d5105fe09dc
-run          full · concurrency on · bench-standard 0.4.0 · betterbench 0.6.1
+thinking     default · reasoning seen
+run          full · concurrency on · bench-standard 0.4.1 · betterbench 0.6.1
 ```
 
 ## Your result
@@ -198,6 +200,7 @@ during the benchmark if you want it.
 | `GPU power limit not detected` | pass `--power-limit W` (or `stock`) |
 | `--kv X but the launch command sets Y` | your `--kv` is wrong; use what the command sets |
 | `greedy_check=differs` | not fatal. Kernels or spec decoding aren't deterministic; mention it |
+| `--thinking off, but the greedy replies contain reasoning` | thinking is still on in the server's chat template or flags. Fix the server, or declare what it does |
 | `launch=unknown` | pass `--server-cmd-file` |
 | `betterbench failed` | see `betterbench.log` in the `.failed` folder, usually a server crash or OOM |
 
@@ -210,5 +213,9 @@ during the benchmark if you want it.
 ## Developing
 
 `bench.sh` is generated: the sources are in [`dev/`](dev/), and `sh dev/build.sh` packs
-them into the one file. Commit `dev/` and the rebuilt `bench.sh` together. What each
+them into the one file. Commit `dev/` and the rebuilt `bench.sh` together.
+
+The source repo is [git.linxweiler.xyz/miga/benchmarks](https://git.linxweiler.xyz/miga/benchmarks).
+Push there. [GitHub](https://github.com/aneinander/benchmarks) is a mirror that Gitea
+updates on every push, so don't push to GitHub directly. What each
 recorded value means and how it's detected: [`dev/DETAILS.md`](dev/DETAILS.md).

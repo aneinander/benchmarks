@@ -43,9 +43,10 @@ can't be detected is left out or shows `unknown`.
 | `precision` | `weights Q4_0 · kv f16` |
 | `launch` | `b 4096 · ub 1024 · fa on · ctk q8_0 · ctv q8_0 · ngl 99 · np 4` |
 | `env_flags` | `GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1`, or `none` |
-| `spec`, `thinking` | `mtp:5`, `default` |
+| `spec` | `mtp:5`, `none` |
+| `thinking` | `default · reasoning seen`, `off · no reasoning seen` (declared · observed) |
 | `greedy_check` | `identical 3/3 · 1d5105fe09dc`, `differs: 2 variants in 3 · first ...` |
-| `run` | `full · concurrency on · bench-standard 0.4.0 · betterbench 0.6.1` |
+| `run` | `full · concurrency on · bench-standard 0.4.1 · betterbench 0.6.1` |
 | `special_notes` | only when given |
 
 The context size appears as BetterBench's own chip.
@@ -84,7 +85,10 @@ test. `--mem-bw` adds the spec figure next to the measured one.
 **Greedy check:** temperature 0, seed 0, 128 tokens, 3 times. `identical` is expected.
 `differs` points to nondeterministic kernels or a broken spec-decoding path. The hash
 lets you compare setups: the same model and quant should give the same hash. A
-different hash isn't automatically wrong, since kernels round differently.
+different hash isn't automatically wrong, since kernels round differently. The check
+also records whether the replies held reasoning: a separate reasoning field, or think
+tags in the text. `bench.sh` warns when `--thinking off` meets reasoning, or when
+`on`/`low`/`medium`/`high` meets none. With `default` the observation is only recorded.
 
 ## After the run
 
