@@ -9,7 +9,7 @@
 set -eu
 dev=$(cd "$(dirname "$0")" && pwd)
 out="$dev/../bench.sh"
-files="bench.sh collect-env.sh gpu-power.sh mem-bw.py config.json standard.env"
+files="bench.sh collect-env.sh gpu-power.sh mem-bw.py model_hash.py notes.py postrun.py models.tsv config.json standard.env"
 eof=__BENCH_STANDARD_EOF__
 . "$dev/standard.env"
 

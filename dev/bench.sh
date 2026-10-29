@@ -113,6 +113,16 @@ sys.exit(not sys.argv[1] or v(sys.argv[1]) < v(sys.argv[2]))' "$have_ver" "$BETT
   die "BetterBench $BETTERBENCH_MIN_VERSION or newer required, found '${have_ver:-not installed}'" \
       "(see https://github.com/GGZ14/BetterBench)"
 command -v curl >/dev/null || die "curl not found"
+# The exact build: two installs can both say 0.6.1. pip records where it came
+# from: a git commit, or a local checkout (then git describes it).
+bb_build=$(bb=$(command -v betterbench) && py=$(sed -n '1s/^#!//p' "$(readlink -f "$bb")") &&
+  $py -c 'import importlib.metadata as m, json
+u = json.loads(m.distribution("betterbench").read_text("direct_url.json") or "{}")
+c = (u.get("vcs_info") or {}).get("commit_id")
+print(c[:12] if c else u.get("url", "")[7:] if u.get("url", "").startswith("file://") else "")' 2>/dev/null) || bb_build=""
+if [ -d "$bb_build" ]; then
+  bb_build=$(git -c safe.directory='*' -C "$bb_build" describe --tags --always --dirty 2>/dev/null) || bb_build=""
+fi
 
 missing=""
 for f in endpoint model tp pp quant kv spec thinking submitter; do
@@ -223,7 +233,7 @@ fi
   [ -n "$pcie" ] && printf 'pcie=%s\n' "$pcie"
   [ -n "$special" ] && printf 'special_notes=%s\n' "$special"
   [ -n "$mem_bw" ] && printf 'mem_bw=%s\n' "$mem_bw"
-  printf 'betterbench=%s\n' "$have_ver"
+  printf 'betterbench=%s\nbetterbench_build=%s\n' "$have_ver" "$bb_build"
   printf 'bench_standard=%s\nrun_mode=%s\nconcurrency=%s\n' "$STANDARD_VERSION" \
     "$([ $quick = 1 ] && echo quick || echo full)" "$([ $no_conc = 1 ] && echo off || echo on)"
 } > "$tmp/mandatory"
@@ -254,201 +264,8 @@ fi
 # The notes are grouped for reading: one chip per topic, nothing twice.
 # The context size is left out - BetterBench shows it from --max-model-len.
 # launch.json: the settings parsed from the launch command, for meta.json.
-python3 - "$tmp/mandatory" "$tmp/collected" "$tmp/measured" "$tmp/cmd.red" "$tmp/launch.json" \
-  > "$tmp/notes" <<'PY'
-import json, shlex, sys
-def kv(path):
-    with open(path, encoding="utf-8") as f:
-        return dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
-m, c, meas = kv(sys.argv[1]), kv(sys.argv[2]), kv(sys.argv[3])
-cmd = open(sys.argv[4], encoding="utf-8").read().strip()
-def g(k):
-    v = c.get(k, "")
-    return "" if v in ("", "unknown") else v
-def join(*parts):
-    return " · ".join(p for p in parts if p) or "unknown"
-
-vendor = {"intel": "Intel", "nvidia": "NVIDIA", "amd": "AMD"}.get(g("gpu_vendor"), g("gpu_vendor"))
-count = g("gpu_count")
-gpu = join(" ".join(p for p in (count and count + "x", vendor if vendor != "none" else "",
-                                g("gpu_model")) if p),
-           g("gpu_vram_gb") and g("gpu_vram_gb") + " GB",
-           g("gpu_driver") and "driver " + g("gpu_driver"))
-
-link, top = g("pcie_link"), g("pcie_max")
-if m.get("pcie"):
-    pcie = m["pcie"] + " (declared)"
-elif link and top and link != top:
-    pcie = f"{link} now, {top} max"   # idle GPUs drop the link speed
-else:
-    pcie = link or "unknown"
-if g("rebar"):
-    pcie += " · ReBAR " + g("rebar")
-
-pl, det = m["power_limit"], g("gpu_power_limit_w")
-if pl == "stock":
-    power = join("stock", det and det + " W")
-else:
-    power = pl + " W"
-    if det and abs(float(det) - float(pl)) > 1:
-        power += f" (GPU reports {det} W)"
-
-virt = g("virt")
-host = join(g("cpu_model"), g("ram_gb") and g("ram_gb") + " GB RAM", g("os"),
-            g("kernel") and "kernel " + g("kernel"), virt != "none" and virt and "VM " + virt)
-
-# Settings in the launch command that swing results but no API reports:
-# batch sizes, flash attention, KV types, env flags. Flags left out of the
-# command are the engine's defaults, which change between versions.
-try:
-    words = shlex.split(cmd.replace("\\\n", " "))
-except ValueError:
-    words = cmd.split()
-env, flags, prog = {}, {}, None
-BOOL = {"--no-mmap", "--mlock", "--enforce-eager", "--enable-prefix-caching",
-        "--no-enable-prefix-caching", "--enable-chunked-prefill",
-        "--no-enable-chunked-prefill", "--cont-batching", "-cb", "--no-cont-batching", "-nocb",
-        "-cmoe", "--cpu-moe", "-rm", "--rm", "-d", "--detach", "-it", "-i", "--privileged"}
-FA_VALUES = {"on", "off", "auto", "1", "0", "true", "false"}
-i = 0
-while i < len(words):
-    w = words[i]
-    nxt = words[i + 1] if i + 1 < len(words) else None
-    if prog is None and "=" in w and not w.startswith("-") and w.split("=", 1)[0].isidentifier():
-        k, v = w.split("=", 1); env[k] = v                     # FOO=1 cmd
-    elif prog is None and not w.startswith("-") and w != "env":
-        prog = w
-    elif w in ("-e", "--env") and nxt is not None and not nxt.startswith("-"):  # docker -e K=V
-        k, _, v = nxt.partition("="); env[k] = v if _ else "(inherited)"; i += 1
-    elif w.startswith("--env="):
-        k, _, v = w[6:].partition("="); env[k] = v if _ else "(inherited)"
-    elif w.startswith("-e") and len(w) > 2 and "=" in w and w[2:].split("=")[0].isidentifier():
-        k, v = w[2:].split("=", 1); env[k] = v
-    elif w.startswith("-"):
-        if "=" in w and w.startswith("--"):
-            k, v = w.split("=", 1); flags[k] = v
-        elif w in ("-fa", "--flash-attn"):
-            if nxt is not None and nxt.lower() in FA_VALUES:
-                flags[w] = nxt; i += 1
-            else:
-                flags[w] = "on"                                   # older bare -fa
-        elif w in BOOL or nxt is None or nxt.startswith("-"):
-            flags[w] = True
-        else:
-            flags[w] = nxt; i += 1
-    i += 1
-
-def flag(*names):
-    for n in names:
-        if n in flags:
-            return flags[n]
-    return None
-
-LLAMA = [("b", ("-b", "--batch-size")), ("ub", ("-ub", "--ubatch-size")),
-         ("fa", ("-fa", "--flash-attn")), ("ctk", ("-ctk", "--cache-type-k")),
-         ("ctv", ("-ctv", "--cache-type-v")), ("ngl", ("-ngl", "--gpu-layers", "--n-gpu-layers")),
-         ("np", ("-np", "--parallel")), ("t", ("-t", "--threads")),
-         ("sm", ("-sm", "--split-mode")), ("ts", ("-ts", "--tensor-split")),
-         ("ot", ("-ot", "--override-tensor")), ("ncmoe", ("-ncmoe", "--n-cpu-moe")),
-         ("cmoe", ("-cmoe", "--cpu-moe")), ("no-mmap", ("--no-mmap",)), ("mlock", ("--mlock",)),
-         ("nocb", ("-nocb", "--no-cont-batching"))]
-LLAMA_ALWAYS = {"b", "ub", "fa", "ctk", "ctv"}   # shown as "default" when not set
-VLLM = ["--max-num-batched-tokens", "--max-num-seqs", "--kv-cache-dtype",
-        "--gpu-memory-utilization", "--dtype", "--quantization", "--block-size",
-        "--enforce-eager", "--enable-chunked-prefill", "--no-enable-chunked-prefill",
-        "--enable-prefix-caching", "--no-enable-prefix-caching", "--attention-backend",
-        "--compilation-config", "-O", "--speculative-config"]
-launch_kind = g("engine")
-if launch_kind not in ("llama.cpp", "vllm"):
-    launch_kind = ("llama.cpp" if prog and "llama-server" in prog or flag("-ngl", "-ub", "-ctk")
-                   else "vllm" if any(f in flags for f in VLLM) else "")
-settings = {}
-if launch_kind == "llama.cpp":
-    for name, al in LLAMA:
-        v = flag(*al)
-        if v is not None:
-            settings[name] = "on" if v is True else v
-        elif name in LLAMA_ALWAYS:
-            settings[name] = "default"
-elif launch_kind == "vllm":
-    for f in VLLM:
-        if f in flags:
-            settings[f.lstrip("-")] = "on" if flags[f] is True else "".join(str(flags[f]).split())
-if not cmd:
-    launch = "unknown (pass --server-cmd-file)"
-else:
-    launch = " · ".join(k if v == "on" and k in ("no-mmap", "mlock", "nocb", "cmoe") or
-                        k.startswith(("enable-", "no-enable-", "enforce-")) else f"{k} {v}"
-                        for k, v in settings.items()) or "no tuning flags"
-# Offline switches and cache paths don't change the numbers.
-QUIET = {"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "HF_HOME",
-         "VLLM_CACHE_ROOT", "PATH", "HOME", "TZ", "LANG", "LC_ALL"}
-env_flags = (" · ".join(f"{k}={v}" for k, v in env.items() if k not in QUIET) or "none"
-             ) if cmd else "unknown"
-json.dump({"engine": launch_kind or None, "settings": settings, "env": env, "flags": flags},
-          open(sys.argv[5], "w", encoding="utf-8"), indent=2, default=str)
-
-# The declared --kv should be what the command sets.
-kvset = [x for x in (settings.get("ctk"), settings.get("ctv"), settings.get("kv-cache-dtype"))
-         if x and x not in ("default", "auto")]
-if kvset and m["kv"] not in kvset + ["/".join(kvset), "_".join(kvset)]:
-    print(f"bench.sh: warning: --kv {m['kv']} but the launch command sets "
-          f"{'/'.join(kvset)}", file=sys.stderr)
-
-mb = g("model_bytes")
-model_file = join(g("model_file"), mb and f"{int(mb) / 1e9:.2f} GB")
-mem_bw = join(g("gpu_mem_bw_gbs") and
-              f'{g("gpu_mem_bw_gbs")} GB/s measured ({g("gpu_mem_bw_tool") or "?"})',
-              m.get("mem_bw") and m["mem_bw"] + " GB/s declared")
-if meas.get("greedy_check") == "identical":
-    greedy = f'identical {meas["greedy_runs"]}/{meas["greedy_runs"]} · {meas["greedy_hash"]}'
-elif meas.get("greedy_check") == "differs":
-    greedy = f'differs: {meas["greedy_variants"]} variants in {meas["greedy_runs"]} · first {meas["greedy_hash"]}'
-else:
-    greedy = "failed"
-
-# --thinking is declared, but the greedy replies show whether the model
-# reasoned: check one against the other.
-seen = meas.get("greedy_reasoning")
-thinking = join(m["thinking"], {"yes": "reasoning seen", "no": "no reasoning seen",
-                                "mixed": "reasoning in some replies"}.get(seen, ""))
-if m["thinking"] == "off" and seen in ("yes", "mixed"):
-    print("bench.sh: warning: --thinking off, but the greedy replies contain reasoning;"
-          " check the server's chat template or reasoning flags", file=sys.stderr)
-elif m["thinking"] in ("on", "low", "medium", "high") and seen == "no":
-    print(f"bench.sh: warning: --thinking {m['thinking']}, but the greedy replies contain no"
-          " reasoning; thinking may be off on the server", file=sys.stderr)
-
-eng = g("engine")
-engine = join(" ".join(p for p in (eng, g("engine_version")) if p),
-              g("engine_slots") and g("engine_slots") + " slots",
-              g("engine_image") and "image " + g("engine_image"),
-              g("proxy") not in ("", "none") and "via " + g("proxy"))
-
-notes = [
-    ("submitter", m["submitter"]),
-    ("gpu", gpu),
-    ("pcie", pcie),
-    ("power_limit", power),
-    ("host", host),
-    ("engine", engine),
-    ("model_file", model_file),
-    ("mem_bw", mem_bw),
-    ("parallel", f"tp {m['tp']} · pp {m['pp']}"),
-    ("precision", f"weights {m['quant']} · kv {m['kv']}"),
-    ("launch", launch),
-    ("env_flags", env_flags),
-    ("spec", m["spec"]),
-    ("thinking", thinking),
-    ("greedy_check", greedy),
-    ("run", join(m["run_mode"], "concurrency " + m["concurrency"],
-                 "bench-standard " + m["bench_standard"], "betterbench " + m["betterbench"])),
-]
-if m.get("special_notes"):
-    notes.append(("special_notes", m["special_notes"]))
-for k, v in notes:
-    print(f"{k}={v}")
-PY
+python3 "$here/notes.py" "$tmp/mandatory" "$tmp/collected" "$tmp/measured" "$tmp/cmd.red" \
+  "$tmp/launch.json" "$here/models.tsv" > "$tmp/notes"
 
 engine=$(get engine) gpu=$(get gpu_model) count=$(get gpu_count) ctx=$(get ctx)
 [ "$engine" != unknown ] || echo "bench.sh: warning: engine not detected; result is hard to compare" >&2
@@ -525,8 +342,15 @@ echo "running betterbench -> $run_dir" >&2
 t_start=$(date +%s.%N)
 # Full output always goes to betterbench.log; the terminal gets all of it
 # (--verbose) or the progress lines and anything that looks like trouble.
+# timeline.tsv stamps each progress line, for the energy of each phase.
 { PYTHONUNBUFFERED=1 betterbench "$@" 2>&1 || echo $? > "$tmp/bb_rc"; } |
   tee "$run_dir/betterbench.log" |
+  python3 -uc 'import sys, time
+tl = open(sys.argv[1], "w", encoding="utf-8")
+for line in iter(sys.stdin.readline, ""):
+    if line.startswith("["):
+        tl.write(f"{time.time():.3f}\t{line}"); tl.flush()
+    sys.stdout.write(line); sys.stdout.flush()' "$run_dir/timeline.tsv" |
   if [ $verbose = 1 ]; then cat; else grep --line-buffered -E '^\[|^phases|warn|WARN|rror|Traceback' || true; fi >&2
 if [ -s "$tmp/bb_rc" ]; then
   mv "$run_dir" "$run_dir.failed" 2>/dev/null || true
@@ -538,104 +362,11 @@ if [ -n "$sampler" ]; then
   [ -s "$run_dir/power.csv" ] || rm -f "$run_dir/power.csv"
 fi
 
-# Energy per token and decode as % of memory bandwidth, from what the run
-# measured. They come after the run, so they go to meta.json ("post_run"),
-# not into the notes of results.json.
-T0=$t_start T1=$t_end python3 - "$run_dir" <<'PY' || echo "bench.sh: warning: post-run figures failed" >&2
-import json, os, statistics, sys
-d = sys.argv[1]
-res = json.load(open(f"{d}/results.json", encoding="utf-8"))
-meta = json.load(open(f"{d}/meta.json", encoding="utf-8"))
-c, m = meta["collected"], meta["mandatory"]
-post = {"wall_s": round(float(os.environ["T1"]) - float(os.environ["T0"]), 1)}
-
-# Output tokens of the measured passes and the concurrency sweep; warm-up
-# passes and prefill probes are not in results.json but draw power too.
-single = [r for recs in (res.get("single_stream") or {}).values() for r in recs
-          if r.get("ok", True)]
-tok = sum(r.get("completion_tokens") or 0 for r in single)
-tok += sum(round(x.get("aggregate_tps", 0) * x.get("wall_s", 0))
-           for x in res.get("concurrency") or [])
-
-rows = []
-if os.path.exists(f"{d}/power.csv"):
-    for line in open(f"{d}/power.csv"):
-        p = line.strip().split(",")
-        try:
-            rows.append((float(p[0]), float(p[1]), float(p[2]) if p[2] else None,
-                         float(p[3]) if len(p) > 3 and p[3] else 0.0))
-        except (ValueError, IndexError):
-            pass
-if len(rows) >= 2:
-    span = rows[-1][0] - rows[0][0]
-    if rows[0][2] is not None and rows[-1][2] is not None and rows[-1][2] >= rows[0][2]:
-        joules, src = rows[-1][2] - rows[0][2], "energy counter"
-    else:
-        joules = sum((b[0] - a[0]) * (a[1] + b[1]) / 2 for a, b in zip(rows, rows[1:]))
-        src = "integrated power"
-    e = {"joules": round(joules), "source": src, "sampled_s": round(span, 1),
-         "avg_w": round(joules / span, 1) if span else None,
-         "peak_w": max(r[1] for r in rows), "output_tokens": tok,
-         "j_per_output_token": round(joules / tok, 3) if tok else None}
-    # A clock-gated idle GPU reads 0 MHz; average the samples where it runs.
-    clk = [r[3] for r in rows if r[3] > 0]
-    if clk:
-        e.update(avg_mhz=round(statistics.mean(clk)), min_mhz=round(min(clk)),
-                 max_mhz=round(max(clk)), clock_samples=f"{len(clk)}/{len(rows)}")
-    post["energy"] = e
-
-# Batch-1 decode reads all weights once per token, so decode t/s x weight
-# bytes is the bandwidth it achieves. Dense models only; spec decoding or MoE
-# can go above 100%.
-tps = [r["decode_tps"] for r in single if r.get("decode_tps")]
-# measured where there is a figure: what the card really reaches
-bw = c.get("gpu_mem_bw_gbs") if c.get("gpu_mem_bw_gbs") not in (None, "", "unknown") else m.get("mem_bw")
-mb = c.get("model_bytes")
-if tps and bw not in (None, "", "unknown") and mb not in (None, "", "unknown"):
-    med = statistics.median(tps)
-    eff = med * int(mb) / 1e9
-    post["roofline"] = {"decode_tps_median": round(med, 2), "model_bytes": int(mb),
-                        "mem_bw_gbs": float(bw), "effective_gbs": round(eff, 1),
-                        "pct_of_mem_bw": round(100 * eff / float(bw), 1)}
-
-# The summary: headline numbers plus the setup that makes them comparable.
-def med(xs):
-    xs = [x for x in xs if x]
-    return statistics.median(xs) if xs else None
-def f(x, unit, d=0):
-    return "—" if x is None else f"{x:,.{d}f} {unit}"
-notes = meta["notes"]
-L = [f"  {meta['model']} · {notes.get('engine', '?')}",
-     f"  {notes.get('gpu', '?')} · {notes.get('power_limit', '?')} limit",
-     f"  {notes.get('run', '?')} · greedy {notes.get('greedy_check', '?')}",
-     f"  decode (batch 1)  {f(med(tps), 't/s', 1)}    TTFT p50  "
-     f"{f(med(r.get('ttft_ms') for r in single), 'ms')}"]
-conc = res.get("concurrency") or []
-if conc:
-    L.append("  concurrency       " + "   ".join(
-        f"{x['level']}: {x.get('aggregate_tps', 0):,.0f} t/s" for x in conc))
-live = [p for p in res.get("prefill") or [] if not p.get("skipped")]
-if live:
-    L.append("  prefill           " + "   ".join(
-        f"{p['target_depth'] // 1000}k: {f(med(p.get('pp_tps') or []), 't/s')}" for p in live))
-if "roofline" in post:
-    r = post["roofline"]
-    L.append(f"  bandwidth         {r['effective_gbs']:.0f} GB/s effective = "
-             f"{r['pct_of_mem_bw']:.0f}% of {r['mem_bw_gbs']:.0f} GB/s ({notes.get('mem_bw', '')})")
-if "energy" in post:
-    e = post["energy"]
-    clock = (f" · clock avg {e['avg_mhz']} MHz ({e['min_mhz']}-{e['max_mhz']})"
-             if "avg_mhz" in e else "")
-    L.append(f"  power             avg {e['avg_w']} W, peak {e['peak_w']:.0f} W{clock}")
-    L.append(f"  energy            {e['joules'] / 1000:.1f} kJ, "
-             f"{e['j_per_output_token']} J per output token (whole run)")
-print("\n" + "\n".join(L), file=sys.stderr)
-
-meta["post_run"] = post
-with open(f"{d}/meta.json", "w", encoding="utf-8") as f:
-    json.dump(meta, f, indent=2)
-    f.write("\n")
-PY
+# Energy (whole run and per phase) and decode as % of memory bandwidth, from
+# what the run measured. They come after the run, so they go to meta.json
+# ("post_run"), not into the notes of results.json.
+T0=$t_start T1=$t_end python3 "$here/postrun.py" "$run_dir" ||
+  echo "bench.sh: warning: post-run figures failed" >&2
 
 # BetterBench with GGZ14/BetterBench#4 fingerprints PCIe and BAR itself
 # (env.gpu.pci), on the machine BetterBench runs on. Say so when that is not

@@ -22,6 +22,7 @@ What `bench.sh` records, how, and how it's built. For running it, see
 | `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run` |
 | `server-cmd.txt` | the server launch command, secrets redacted |
 | `power.csv` | `epoch_s,watts,joules,mhz` during the run |
+| `timeline.tsv` | when each BetterBench progress line appeared, for the energy per phase |
 | `betterbench.log` | BetterBench's full output |
 
 ## Notes
@@ -37,7 +38,7 @@ can't be detected is left out or shows `unknown`.
 | `power_limit` | `200 W`, or `180 W (GPU reports 200 W)` |
 | `host` | `AMD EPYC 7282 16-Core Processor · 60 GB RAM · Ubuntu 26.04.1 LTS · kernel 7.0.0-38-generic · VM kvm` |
 | `engine` | `llama.cpp b11913-7aca0d2ea · 4 slots · image ghcr.io/ggml-org/llama.cpp:server-intel@1a2b3c4d5e6f · via llama-swap` |
-| `model_file` | `/models/Qwen3.8-27B-Q4_0.gguf · 15.60 GB` (weights as stored) |
+| `model_file` | `/models/Qwen3.8-27B-UD-Q4_K_M.gguf · 16.46 GB · standard: Qwen3.8-27B UD-Q4_K_M`, `... · not a standard model (sha256 4f58a79550e8)` |
 | `mem_bw` | `532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared` |
 | `parallel` | `tp 1 · pp 1` |
 | `precision` | `weights Q4_0 · kv f16` |
@@ -46,7 +47,7 @@ can't be detected is left out or shows `unknown`.
 | `spec` | `mtp:5`, `none` |
 | `thinking` | `default · reasoning seen`, `off · no reasoning seen` (declared · observed) |
 | `greedy_check` | `identical 3/3 · 1d5105fe09dc`, `differs: 2 variants in 3 · first ...` |
-| `run` | `full · concurrency on · bench-standard 0.4.1 · betterbench 0.6.1` |
+| `run` | `full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1`, or `... · betterbench 0.6.1 @ v0.6.1-3-gabc1234-dirty` for a build that isn't the release |
 | `special_notes` | only when given |
 
 The context size appears as BetterBench's own chip.
@@ -76,6 +77,19 @@ launch command. For a docker server the image is recorded with its ID, because t
   put them in the command.
 - If `--kv` doesn't match the command, `bench.sh` warns.
 
+**Model file:** the path comes from the launch command. `model_hash.py` hashes it the
+way the README's Models section does (a GGUF file, or the `*.safetensors` of a
+directory) and looks the hash up in `models.tsv`. Not a standard model, or a `--quant`
+that differs from the table, gives a warning. Per-file hashes are cached in
+`~/.cache/bench-standard/sha256.tsv` by path, size and mtime, so only the first run
+waits (about a minute for 16 GB). `HASH_MODEL=0` skips it, and the note then reads
+`hash not checked`. When the server runs in docker, the path is the one inside the
+container. If that path doesn't exist on the host, the hash can't be checked either.
+
+**BetterBench build:** read from pip's record of where it was installed from: the git
+commit for `pip install git+...`, or `git describe` of the checkout for an editable
+install. A release tag adds nothing to the `run` note; a commit or `-dirty` does.
+
 **Memory bandwidth:** `mem-bw.py` copies 1 GiB of random data with torch, inside the
 server's container (same GPU, env and torch), or with `$BW_PYTHON`. It uses random
 data because Arc compresses uniform buffers: zeros read 1627 GB/s on a B65 that really
@@ -95,16 +109,23 @@ tags in the text. `bench.sh` warns when `--thinking off` meets reasoning, or whe
 These go to `meta.json` under `post_run` and the summary, not to the notes, which are
 fixed before BetterBench starts.
 
-- **energy:** kJ, average and peak W, J per output token, and average, min and max clock.
-  The clock counts only samples where the GPU is running. The figures cover the
-  **whole run**, warm-up and prefill included, so compare only runs of the same mode.
+- **energy:** kJ, average and peak W, J per output token over the whole run, and
+  average, min and max clock. The clock counts only samples where the GPU is running.
   Power is sampled only when BetterBench runs on the server. On a split setup, run
   `bench.sh power > power.csv` on the server yourself.
+- **energy per phase** (`energy.phases`): each BetterBench progress line is stamped in
+  `timeline.tsv`, and a piece of work lasts until the next line. That gives joules and
+  average W for decode (J per output token), prefill (J per 1000 prompt tokens) and each
+  concurrency level (J per token). The warm-up passes draw power but aren't in
+  `results.json`, so their tokens are estimated from the measured passes of the same
+  piece (`tokens_incl_warmup_est`). These compare across quick and full runs; the
+  whole-run figure doesn't.
 - **roofline:** median batch-1 decode t/s × weight bytes ÷ memory bandwidth = % of
-  bandwidth. It holds for dense models. Spec decoding and MoE can exceed 100%. So
-  can models quantized at load (e.g. vLLM fp8 from bf16 files), because they read
-  fewer bytes than are stored. For safetensors the size includes every file, so the
-  RedHatAI models' MTP head adds about 5%.
+  bandwidth. The weight bytes are what vLLM logs as loaded ("Model loading took X GiB",
+  per GPU, × tp), which is right for models quantized at load (fp8 from bf16 files reads
+  half of what's stored). Otherwise the stored size, without `*mtp*` files, since plain
+  decoding doesn't read an MTP head. With tp > 1 the bandwidth is per GPU × tp. It holds
+  for dense models; spec decoding and MoE can exceed 100%.
 
 ## BetterBench with PR #4
 
@@ -117,8 +138,8 @@ mismatch between runs with and without the PR.
 ## Building
 
 People download only the root `bench.sh`. It's generated: `dev/build.sh` packs
-`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `config.json` and
-`standard.env` into it. At run time it unpacks them to a temp dir and runs
+`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `model_hash.py`,
+`notes.py`, `postrun.py`, `models.tsv`, `config.json` and `standard.env` into it. At run time it unpacks them to a temp dir and runs
 `dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
 and `bench.local.env` stay next to the downloaded file.
 
@@ -126,7 +147,11 @@ and `bench.local.env` stay next to the downloaded file.
 sh dev/build.sh            # after any change in dev/; commit dev/ and bench.sh together
 sh dev/build.sh --check    # fails if bench.sh is out of date
 sh dev/bench.sh --help     # dev/bench.sh also runs directly, results in dev/results/
+pytest dev/tests           # the notes, model hash and post-run figures
 ```
+
+CI (`.github/workflows/ci.yml`) runs shellcheck, `build.sh --check` and the tests.
+A model added to the README's table goes into `dev/models.tsv` too.
 
 BetterBench 0.6.1 is the oldest version that works (`BETTERBENCH_MIN_VERSION` in
 `standard.env`). Newer ones run too, and their version goes into the `run` note.

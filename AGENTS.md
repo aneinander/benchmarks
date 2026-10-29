@@ -26,8 +26,12 @@ one makes the run fail. Correct is more important than fast.
 ## Models
 
 Results only count for the files in the [README's model table](README.md#models).
-Check the served file's SHA256 against it, with the commands below the table. On a
-mismatch, tell your human before benchmarking. `--quant` for each model is in that table.
+`bench.sh` hashes the served file during the dry run and warns on a non-standard file
+or a wrong `--quant`. The `model_file` note then says `standard: ...` or
+`not a standard model`. On a mismatch, tell your human before benchmarking. If it says
+`hash not checked` (the path from the launch command doesn't exist on this machine,
+e.g. inside a container), check by hand with the commands below the table.
+`--quant` for each model is in that table.
 
 ## Procedure
 
@@ -98,7 +102,7 @@ background job, so a dropped session doesn't kill the benchmark.
 
 Tell your human:
 - the result folder (printed after `done:`)
-- the summary block: decode t/s, TTFT, concurrency, prefill, bandwidth %, power, energy
+- the summary block: decode t/s, TTFT, concurrency, prefill, bandwidth %, power, energy per phase
 - every warning, and whether the greedy check was `identical`
 - that the folder is what they send in, and that they should check `server-cmd.txt` for
   anything private first (tokens, keys and passwords are already redacted)
@@ -111,6 +115,8 @@ Tell your human:
 | `warm-up request failed (HTTP ...)` | server not up, or wrong `--endpoint`/`--model` (step 2). Behind llama-swap the first load can take minutes; `WARM_TIMEOUT=1800` gives it longer |
 | `missing mandatory value(s)` | pass the listed flags (step 4) |
 | `GPU power limit not detected here` | ask for the limit, pass `--power-limit W` or `stock` |
+| `the model file is not one of the standard models` | the server serves a different file. Tell your human; results with it won't count |
+| `--quant X, but the file is the standard ...` | declare the `--quant` the warning names |
 | `--kv X but the launch command sets Y` | the declared `--kv` is wrong. Use what the command sets |
 | `greedy_check=differs` | not a failure, but report it. It means nondeterministic kernels or a broken spec-decoding path |
 | `--thinking X, but the greedy replies ...` | the declared thinking mode doesn't match what the server does. Ask your human which is right; never change the server yourself |

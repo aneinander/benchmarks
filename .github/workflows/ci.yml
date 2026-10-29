@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install pytest shellcheck-py
+      - name: shellcheck
+        run: shellcheck -s sh -S warning dev/*.sh bench.sh
+      - name: bench.sh is built from dev/
+        run: sh dev/build.sh --check
+      - name: tests
+        run: pytest -q dev/tests

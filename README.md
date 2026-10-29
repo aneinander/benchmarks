@@ -50,8 +50,10 @@ longer and keeps the GPU busy the whole time.
 
 ## Models
 
-Results only count for these files. Check the hash before you benchmark: a
-different file is a different benchmark.
+Results only count for these files: a different file is a different benchmark.
+`bench.sh` hashes the served file and warns when it isn't one of these, or when
+`--quant` doesn't match. The first run takes about a minute for a big file, then the
+hash is cached. To check by hand before downloading everything into place:
 
 | model | engine | Hugging Face repo | file | `--quant` |
 |---|---|---|---|---|
@@ -137,7 +139,8 @@ file next to `bench.sh`.
 4. **BetterBench:** single-stream decode per category, a prefill sweep and a
    concurrency sweep. GPU power, energy and clock are sampled throughout.
 5. **Summary:** decode t/s, TTFT, concurrency and prefill throughput, % of memory
-   bandwidth reached, average power and clock, and J per token.
+   bandwidth reached, average power and clock, and energy: J per token for decode and
+   each concurrency level, J per 1000 tokens for prefill.
 
 Everything is recorded as notes in `results.json`, so it shows in the report and in
 `compare`. Example notes:
@@ -146,12 +149,13 @@ Everything is recorded as notes in `results.json`, so it shows in the report and
 gpu          1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395
 pcie         Gen4 x16 · ReBAR on
 engine       llama.cpp b11913-7aca0d2ea · 4 slots · image ghcr.io/ggml-org/llama.cpp:server-intel@1a2b3c4d5e6f
+model_file   /models/Qwen3.8-27B-UD-Q4_K_M.gguf · 16.46 GB · standard: Qwen3.8-27B UD-Q4_K_M
 launch       b 4096 · ub 1024 · fa on · ctk q8_0 · ctv q8_0 · ngl 99 · np 4
 env_flags    GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1
 mem_bw       532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared
 greedy_check identical 3/3 · 1d5105fe09dc
 thinking     default · reasoning seen
-run          full · concurrency on · bench-standard 0.4.1 · betterbench 0.6.1
+run          full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1
 ```
 
 ## Your result
@@ -164,7 +168,7 @@ Each run makes a folder `results/<date>-<you>-<model>-<engine>-<gpu>/`:
 | `results.json` | the results, with all notes |
 | `meta.json` | every raw value, plus energy and % of bandwidth |
 | `server-cmd.txt` | your server's launch command, secrets redacted |
-| `config.json`, `power.csv`, `betterbench.log` | the config used, power samples, the full output |
+| `config.json`, `power.csv`, `timeline.tsv`, `betterbench.log` | the config used, power samples, when each phase ran, the full output |
 
 **Send the whole folder of a `--full` run.** Check `server-cmd.txt` for anything private
 first. Tokens, keys and passwords are redacted automatically.
@@ -198,6 +202,8 @@ during the benchmark if you want it.
 | `warm-up request failed` | is the server up? Are `--endpoint` and `--model` right? `curl URL/models` lists the ids. For a slow first load, try `WARM_TIMEOUT=1800` |
 | `missing mandatory value(s)` | pass the listed flags |
 | `GPU power limit not detected` | pass `--power-limit W` (or `stock`) |
+| `the model file is not one of the standard models` | you're serving a different file. Download the one from the [table](#models) |
+| `--quant X, but the file is the standard ...` | declare the `--quant` the warning names |
 | `--kv X but the launch command sets Y` | your `--kv` is wrong; use what the command sets |
 | `greedy_check=differs` | not fatal. Kernels or spec decoding aren't deterministic; mention it |
 | `--thinking off, but the greedy replies contain reasoning` | thinking is still on in the server's chat template or flags. Fix the server, or declare what it does |
@@ -213,7 +219,8 @@ during the benchmark if you want it.
 ## Developing
 
 `bench.sh` is generated: the sources are in [`dev/`](dev/), and `sh dev/build.sh` packs
-them into the one file. Commit `dev/` and the rebuilt `bench.sh` together.
+them into the one file. Commit `dev/` and the rebuilt `bench.sh` together. CI runs
+shellcheck, checks that `bench.sh` is up to date, and runs `pytest dev/tests`.
 
 Bugs and ideas: open an issue on [GitHub](https://github.com/aneinander/benchmarks/issues).
 The GitHub repo is a mirror, updated automatically from the maintainers' source repo.

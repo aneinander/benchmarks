@@ -10,7 +10,8 @@
 #   --server-cmd-out  behind llama-swap: write the model's launch command (raw) to FILE
 #   --server-cmd-file the launch command when not behind llama-swap (finds the container)
 # env: BETTERBENCH_API_KEY, PROBE_TIMEOUT (s, default 10), LOAD_TIMEOUT (s, default 600),
-#      MEASURE_BW=0 (skip the bandwidth test), BW_PYTHON (python with torch for it)
+#      MEASURE_BW=0 (skip the bandwidth test), BW_PYTHON (python with torch for it),
+#      HASH_MODEL=0 (skip hashing the model file)
 
 set -u
 LC_ALL=C; export LC_ALL
@@ -27,7 +28,7 @@ while [ $# -gt 0 ]; do
     --api-key)        need $# "$1"; api_key=$2; shift 2 ;;
     --server-cmd-out) need $# "$1"; cmd_out=$2; shift 2 ;;
     --server-cmd-file) need $# "$1"; cmd_file=$2; shift 2 ;;
-    -h|--help)        sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "collect-env: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -250,7 +251,8 @@ PY
 fi
 
 # Weight bytes as stored: a single file, the parts of a split GGUF
-# (-00001-of-0000N.gguf), or the *.safetensors of a model directory.
+# (-00001-of-0000N.gguf), or the *.safetensors of a model directory, without
+# an MTP head (*mtp*), which plain decoding doesn't read.
 model_bytes=""
 if [ -f "$model_file" ]; then
   case $model_file in
@@ -259,7 +261,7 @@ if [ -f "$model_file" ]; then
   esac
   model_bytes=$(stat -c %s "$@" 2>/dev/null | awk '{s += $1} END {if (s) printf "%d", s}')
 elif [ -d "$model_file" ]; then
-  model_bytes=$(find "$model_file" -maxdepth 1 -name '*.safetensors' -exec stat -c %s {} + 2>/dev/null |
+  model_bytes=$(find "$model_file" -maxdepth 1 -name '*.safetensors' ! -name '*mtp*' -exec stat -c %s {} + 2>/dev/null |
                 awk '{s += $1} END {if (s) printf "%d", s}')
 fi
 
@@ -274,12 +276,28 @@ if [ -n "$container" ] && have docker &&
   engine_image=$(printf '%s' "$i" | sed 's/@sha256:\(.\{12\}\).*/@\1/')
 fi
 
+# vLLM logs what the weights take in GPU memory, per worker. That beats the
+# stored size when it quantizes at load (fp8 from bf16 files reads half).
+model_loaded_gib=""
+if [ "$engine" = vllm ] && [ -n "$container" ] && have docker; then
+  model_loaded_gib=$(docker logs "$container" 2>&1 | sed -n 's/.*Model loading took \([0-9.]*\) GiB.*/\1/p' | tail -n1)
+fi
+
+# The model's SHA256, checked against the standard models (README, Models).
+# The first time takes a while for a big file, then it's cached.
+# HASH_MODEL=0 skips it.
+model_sha256=""
+here=$(cd "$(dirname "$0")" && pwd)
+if [ "${HASH_MODEL:-1}" != 0 ] && [ -e "$model_file" ] && have python3; then
+  echo "collect-env: hashing the model file (cached after the first time) ..." >&2
+  model_sha256=$(python3 "$here/model_hash.py" "$model_file" 2>/dev/null)
+fi
+
 # Measured memory bandwidth, the base for "% of peak". mem-bw.py copies random
 # data with torch, inside the server's container (same GPU, env and torch), or
 # with $BW_PYTHON. Fallback: clpeak, whose test data may compress on Arc and
 # read high. A few seconds and 2 GiB of free VRAM; MEASURE_BW=0 skips it.
 gpu_mem_bw_gbs="" gpu_mem_bw_tool=""
-here=$(cd "$(dirname "$0")" && pwd)
 if [ "${MEASURE_BW:-1}" != 0 ]; then
   if [ -n "${BW_PYTHON:-}" ]; then
     r=$(timeout 300 "$BW_PYTHON" "$here/mem-bw.py" 2>/dev/null)
@@ -329,5 +347,7 @@ kv engine_slots "$engine_slots"
 kv engine_image "$engine_image"
 kv model_file "$model_file"
 kv model_bytes "$model_bytes"
+kv model_loaded_gib "$model_loaded_gib"
+kv model_sha256 "$model_sha256"
 kv ctx "$ctx"
 exit 0
