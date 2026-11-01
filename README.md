@@ -15,14 +15,25 @@ machine with your GPU:
 Help me benchmark my LLM server with bench-standard. Read these two files first:
 https://raw.githubusercontent.com/aneinander/benchmarks/main/AGENTS.md
 https://raw.githubusercontent.com/aneinander/benchmarks/main/README.md
-Then follow AGENTS.md step by step: install what's missing, find my server and model,
-check the model hash, work out the values to declare from my server's launch command,
-and do a dry run and a quick run. Ask me for anything you can't find out yourself,
-and ask me before the --full run.
+Then follow AGENTS.md step by step. Start with its round 1 questions, all in one
+numbered message, before you run anything. Install what's missing, find my server and
+model, check the model hash, work out the values to declare from my server's launch
+command, and do a dry run. Show me the round 2 table of values to confirm, then do a
+quick run, and ask me the round 3 questions before the --full run.
 ```
 
 The agent follows [`AGENTS.md`](AGENTS.md), a step-by-step procedure with rules that keep
-the result valid. Without an agent, do it yourself as described below.
+the result valid. It asks you three rounds of numbered questions with defaults already
+filled in, so you mostly confirm:
+
+1. **Before it starts:** your name, the server's address, whether it needs an API key
+   (you set that yourself, it never goes in the chat), how the server was started, the
+   model, the number of GPUs, the power limit, anything unusual.
+2. **After the dry run:** a table of every value it will declare and where each came
+   from, plus every warning.
+3. **Before the full run:** whether to start it, and in tmux or the background.
+
+Without an agent, do it yourself as described below.
 
 ## Quick start
 
@@ -34,15 +45,40 @@ curl -O https://raw.githubusercontent.com/aneinander/benchmarks/main/bench.sh &&
 ```
 
 Serve one of the [models](#models) with any OpenAI-compatible server (llama.cpp, vLLM,
-...), then:
+...). Then copy this into a text editor, fill in the top part, and paste it into the
+terminal in the folder with `bench.sh`. [What you declare](#what-you-declare) explains
+how to read each value off your server's launch command.
 
 ```sh
-./bench.sh --endpoint http://localhost:8080/v1 --model MODEL_ID \
-  --tp 1 --pp 1 --quant Q4_K_M --kv f16 --spec none --thinking default \
-  --submitter YOUR_NAME --server-cmd-file server-cmd.txt
+# ─── fill these in ──────────────────────────────────────────────────────────
+SUBMITTER=your-name                 # you
+ENDPOINT=http://localhost:8080/v1   # the server's base URL, ending in /v1
+MODEL=MODEL_ID                      # the id exactly as `curl $ENDPOINT/models` lists it
+QUANT=Q4_K_M                        # from the model table: Q4_K_M, UD-Q4_K_M or w4a16
+KV=f16                              # KV cache type: f16, q8_0, q8_0/f16 (K/V), bf16, fp8
+TP=1                                # tensor parallel size (1 on one GPU)
+PP=1                                # pipeline parallel size (1 on one GPU)
+SPEC=none                           # speculative decoding: none, mtp:5, draft:8, ...
+THINKING=default                    # set on the server: default, off, on, low, medium, high
+SERVER_CMD=server-cmd.txt           # file with the command that started the server;
+                                    #   leave empty behind llama-swap
+# export BETTERBENCH_API_KEY=...    # only if the server needs a key; never saved
+# ─── then run (add --full for the run that counts) ──────────────────────────
+./bench.sh --submitter "$SUBMITTER" --endpoint "$ENDPOINT" --model "$MODEL" \
+  --quant "$QUANT" --kv "$KV" --tp "$TP" --pp "$PP" --spec "$SPEC" --thinking "$THINKING" \
+  ${SERVER_CMD:+--server-cmd-file "$SERVER_CMD"}
 ```
 
-That's a **quick check** of a few minutes. If the summary at the end looks right,
+Add `--dry-run` first to see what it detects and every warning without running the
+benchmark. To write the launch command into `server-cmd.txt`, paste it into the file
+exactly as you typed it, env vars and docker `-e` flags included, or for a running
+process:
+
+```sh
+ps -o args= -p "$(pgrep -f 'llama-server|vllm' | head -n1)" > server-cmd.txt
+```
+
+Without `--full`, that's a **quick check** of a few minutes. If the summary at the end looks right,
 run the same command with `--full`. That's the result that counts. It takes much
 longer and keeps the GPU busy the whole time.
 

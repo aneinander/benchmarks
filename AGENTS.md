@@ -10,18 +10,23 @@ one makes the run fail. Correct is more important than fast.
 
 ## Rules
 
+- **Ask in the three rounds below**, not one question at a time: round 1 before you
+  start, round 2 after detecting, round 3 before `--full`. Number the questions so your
+  human can answer `1: pascal, 2: yes, ...`, and fill in what you already know as a
+  default they only have to confirm. "Don't know, find it" is always a valid answer.
 - **Run benchmarks only through `./bench.sh`.** Never call `betterbench run` directly,
   and never add BetterBench flags. `bench.sh` refuses them.
 - **Don't edit `bench.sh`** to make a run pass. If it seems wrong, tell your human.
 - **Never edit anything in a results folder.**
-- **Never guess a declared value silently.** Derive it from the launch command (step 4),
-  show your human what you derived, and ask when the command doesn't say.
-  `--submitter` always comes from the human.
-- **Ask before `--full`.** It takes much longer than the quick run, and the GPU is busy
-  the whole time.
+- **Never guess a declared value silently.** Derive it from the launch command, show
+  it in round 2, and ask when the command doesn't say. `--submitter` always comes from
+  the human.
+- **Ask before `--full`** (round 3). It takes much longer than the quick run, and the
+  GPU is busy the whole time.
 - **Don't restart, reconfigure or stop the inference server** without asking. Don't
   start other GPU work while a benchmark runs.
-- **API keys** go in `$BETTERBENCH_API_KEY`, never into files or commands that get saved.
+- **API keys** go in `$BETTERBENCH_API_KEY`, never into files, saved commands or the
+  chat. Ask your human to set it themselves in the shell you use.
 
 ## Models
 
@@ -35,7 +40,39 @@ model is in that table.
 
 ## Procedure
 
-### 1. Check the tools
+### 1. Round 1: the setup questions
+
+Ask these in one message, before running anything. Put the default in brackets.
+
+```text
+Before I start, a few questions. Answer by number; "find it" is fine for any of them.
+
+1. Your name for the results (--submitter):
+2. Is this the machine with the GPU and the inference server? [yes]
+3. The server's address [http://localhost:8080/v1]:
+4. Does the server need an API key? [no]
+   If yes, don't paste it here: run  export BETTERBENCH_API_KEY=...  in the
+   terminal I work in, and tell me when it's set.
+5. How was the server started? llama-swap / docker / a script / a command.
+   Paste the command or the script's path if you have it [find it]:
+6. Which model from the README table is loaded? [find it]
+7. How many GPUs does the server use? [1]
+8. Is the GPU power limit changed from stock? [stock / watts / don't know]
+9. Anything unusual? A VM, undervolt, custom kernels, a patched engine [no]
+10. May I install BetterBench if it's missing? [yes; I'll ask before upgrading one]
+```
+
+What the answers mean:
+- **2 = no:** BetterBench runs elsewhere. Use `--env-file` ([below](#when-something-goes-wrong)).
+- **4 = yes:** wait until they say it's set. Check with `[ -n "$BETTERBENCH_API_KEY" ]`,
+  never by printing it.
+- **5:** a pasted command goes into `server-cmd.txt` exactly as given (step 3).
+- **7 > 1 with llama.cpp:** ask how the model is split (`-sm`, `-ts`) for `--tp`/`--pp`.
+- **8:** watts → `--power-limit W`. `stock` or "don't know" → let `bench.sh` read it.
+- **9:** a VM → ask for the PCIe link if they know it (`--pcie "Gen4 x16"`).
+  Anything else → `--special-notes "..."`.
+
+### 2. Check the tools
 
 ```sh
 ./bench.sh --version          # bench-standard version and the BetterBench it needs
@@ -43,10 +80,12 @@ betterbench --version         # 0.6.1 or newer
 python3 --version             # 3.10+
 ```
 
-If something is missing, install it as the README's quick start shows. If an older one is installed, ask
-before upgrading it.
+If something is missing, install it as the README's quick start shows (if answer 10
+allows it). If an older one is installed, ask before upgrading it.
 
-### 2. Find the endpoint and the model id
+### 3. Find the endpoint, the model id and the launch command
+
+Start from the answers to 3, 5 and 6, and verify them:
 
 ```sh
 curl -s http://localhost:8080/v1/models     # ids the server accepts
@@ -54,22 +93,22 @@ curl -s http://localhost:8080/running       # llama-swap only: loaded models + l
 ```
 
 `--endpoint` is the base URL ending in `/v1`. `--model` is the id exactly as listed.
+Nothing answers: look for listening ports (`ss -ltnp`) and containers (`docker ps`).
 
-### 3. Get the launch command
-
+The launch command:
 - **Behind llama-swap** (`/running` answers): nothing to do, `bench.sh` reads it.
 - **Otherwise:** write the exact command the server was started with into
   `server-cmd.txt`, including `VAR=value` env prefixes and docker `-e` flags. Pass it
-  with `--server-cmd-file server-cmd.txt`. Get the command from your human, a launch
-  script, `docker inspect`, or `ps -o args= -p PID`.
+  with `--server-cmd-file server-cmd.txt`. Get it from answer 5, a launch script,
+  `docker inspect`, or `ps -o args= -p PID`. Env vars set in llama-swap's `env:` block
+  or in the shell that started the server aren't in any of these: ask.
 
 Without it, the `launch` and `env_flags` notes read `unknown`, and those settings
 swing results by 10-50%.
 
 ### 4. Derive the declared values
 
-`--quant` comes from the README's model table. For the rest, use the launch command and confirm
-with your human:
+`--quant` comes from the README's model table. The rest comes from the launch command:
 
 | flag | llama.cpp | vLLM |
 |---|---|---|
@@ -77,11 +116,7 @@ with your human:
 | `--tp` / `--pp` | `1` / `1` on one GPU; multi-GPU: ask | `--tensor-parallel-size` / `--pipeline-parallel-size`; default `1` |
 | `--spec` | `-md`/`--model-draft` with `--draft-max N` → `draft:N`; otherwise `none` | `--speculative-config` method and `num_speculative_tokens` → e.g. `mtp:5`, `eagle3:4`, `ngram:4`; otherwise `none` |
 | `--thinking` | `--reasoning-budget 0` or `enable_thinking: false` in the template kwargs → `off`; unclear → ask | `enable_thinking`/effort in the chat template or default kwargs; nothing set → `default`; unclear → ask |
-| `--submitter` | ask | ask |
-
-`bench.sh` checks `--kv`, `--spec`, `--thinking` (and `--tp`/`--pp` for vLLM) against the
-launch command and warns `--X A but the launch command sets ...: declare --X B`. Don't
-just switch to B: show your human the warning and confirm.
+| `--submitter` | answer 1 | answer 1 |
 
 ### 5. Dry run
 
@@ -91,24 +126,61 @@ just switch to B: show your human the warning and confirm.
 ```
 
 This sends the warm-up and the greedy check, detects everything, prints what it would
-run, and stops. Check the `--note` values in that output:
-- `unknown` values should have a reason (VM PCIe, no cmd file, ...).
-- Any `bench.sh: warning:` line needs fixing or explaining before the real run. The dry
-  run repeats them all at the end.
+run, and stops. `bench.sh` checks `--kv`, `--spec`, `--thinking` (and `--tp`/`--pp` for
+vLLM) against the launch command and the model file against the README's table, and
+lists every warning at the end.
 
-### 6. Quick run, then full run
+### 6. Round 2: confirm the values
+
+Show your human one table with every declared value, where it came from, and what the
+dry run found, then ask them to confirm or correct it:
+
+```text
+Here is what I'll declare. Reply "ok", or correct a line by number.
+
+  #  flag           value        from
+  1  --endpoint     http://localhost:8080/v1   your answer, /v1/models answers
+  2  --model        qwen3.5-9b   /v1/models
+  3  --quant        Q4_K_M       README table; hash matches Qwen3.5-9B-Q4_K_M.gguf
+  4  --kv           q8_0/f16     -ctk q8_0, no -ctv (V defaults to f16)
+  5  --tp / --pp    1 / 1        one GPU
+  6  --spec         none         no -md in the launch command
+  7  --thinking     default      nothing in the command; greedy replies show reasoning
+  8  --submitter    pascal       your answer
+  9  --power-limit  (detected)   GPU reports 250 W
+  10 launch         b 4096 · ub 1024 · fa on · ...   server-cmd.txt
+
+Warnings from the dry run:
+  - ... (each one, with what you think it means)
+
+Notes that read unknown, and why:
+  - ...
+```
+
+Every `bench.sh: warning:` needs fixing or an explanation before the real run. For
+`--X A but the launch command sets ...: declare --X B`, don't just switch to B: show it
+here and let your human decide. Rerun the dry run after any change.
+
+### 7. Quick run
 
 Run the same command without `--dry-run`. This is a quick check of a few minutes,
-ending in a summary. If it looks sane, ask your human, then run again with `--full`.
-That is the result that counts. For long runs, use a terminal multiplexer or a
-background job, so a dropped session doesn't kill the benchmark.
+ending in a summary (also saved as `summary.txt` in the result folder).
 
-### 7. Report back
+### 8. Round 3: before the full run
+
+```text
+The quick run finished: decode X t/s, TTFT Y ms, N warnings (listed below).
+
+1. Start the --full run now? It takes much longer and keeps the GPU busy. [yes]
+2. Run it in tmux/screen or in the background, so a dropped session doesn't stop it? [yes]
+3. Is anything else using the GPU right now that should be stopped first? [no]
+```
+
+### 9. Report back
 
 Tell your human:
 - the result folder (printed after `done:`)
 - the summary block: decode t/s, TTFT, concurrency, prefill, bandwidth %, power, energy
-  (also in `summary.txt` in the folder)
 - every warning (listed at the end of the summary), and whether the greedy check was
   `identical`
 - that the folder is what they send in, and that they should check `server-cmd.txt` for
@@ -118,11 +190,11 @@ Tell your human:
 
 | message | what to do |
 |---|---|
-| `BetterBench 0.6.1 or newer required` | install or upgrade BetterBench (step 1) |
-| `warm-up request failed (HTTP ...)` | server not up, or wrong `--endpoint`/`--model` (step 2). Behind llama-swap the first load can take minutes; `WARM_TIMEOUT=1800` gives it longer |
+| `BetterBench 0.6.1 or newer required` | install or upgrade BetterBench (step 2) |
+| `warm-up request failed (HTTP ...)` | server not up, or wrong `--endpoint`/`--model` (step 3). HTTP 401/403: the server needs an API key (round 1, question 4). Behind llama-swap the first load can take minutes; `WARM_TIMEOUT=1800` gives it longer |
 | `missing mandatory value(s)` | pass the listed flags (step 4) |
 | `GPU power limit not detected here` | ask for the limit, pass `--power-limit W` or `stock` |
-| `--X A but the launch command sets ...: declare --X B` | the declared value contradicts the launch command. Confirm with your human, then use B |
+| `--X A but the launch command sets ...: declare --X B` | the declared value contradicts the launch command. Confirm with your human (round 2), then use B |
 | `not one of the standard models` | the served file's hash isn't in the README's table: wrong file or quant. Tell your human |
 | `--quant X but the model file is NAME` | use the `--quant` the table lists for that file |
 | `greedy check failed (...)` | the server rejected or timed out the temperature-0 requests; read the error |
