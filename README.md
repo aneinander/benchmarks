@@ -78,6 +78,28 @@ process:
 ps -o args= -p "$(pgrep -f 'llama-server|vllm' | head -n1)" > server-cmd.txt
 ```
 
+### Save your values
+
+So you don't fill these in every time, save them once:
+
+```sh
+./bench.sh init        # writes bench.local.env next to bench.sh, every value explained
+nano bench.local.env   # fill in the empty ones
+./bench.sh --dry-run   # then just this; --full for the run that counts
+```
+
+`bench.local.env` holds one `BENCH_...=value` per line (`BENCH_SUBMITTER`,
+`BENCH_ENDPOINT`, `BENCH_MODEL`, `BENCH_SERVER_CMD_FILE`, `BENCH_QUANT`, `BENCH_KV`,
+`BENCH_TP`, `BENCH_PP`, `BENCH_SPEC`, `BENCH_THINKING`, and optional ones like
+`BENCH_POWER_LIMIT`). It's read as plain values, never run as a script. Relative paths
+in it are relative to the file. A flag on the command line wins over an environment
+variable, which wins over the file. Every run prints which values came from the file.
+For a second server or model, keep a second file and pass `--settings other.env`.
+The API key never goes in it: `bench.sh` refuses `BETTERBENCH_API_KEY` there. Export
+it in your shell.
+
+### The run
+
 Without `--full`, that's a **quick check** of a few minutes. If the summary at the end looks right,
 run the same command with `--full`. That's the result that counts. It takes much
 longer and keeps the GPU busy the whole time.
@@ -163,9 +185,9 @@ llama-swap you can leave it out, because the command is read automatically.
 | `--no-concurrency` | skip the concurrency sweep |
 | `--results-dir DIR` | where run folders go (default `results/` next to `bench.sh`) |
 
-The declared values can also come from the environment (`BENCH_SUBMITTER=pascal`,
-`BENCH_QUANT=...`, ...). Machine-local defaults like these go in a `bench.local.env`
-file next to `bench.sh`.
+| `--settings FILE` | read saved values from FILE instead of `bench.local.env` |
+
+Every value can also be saved, see [Save your values](#save-your-values).
 
 ## What a run does
 

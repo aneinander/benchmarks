@@ -62,6 +62,10 @@ Before I start, a few questions. Answer by number; "find it" is fine for any of 
 10. May I install BetterBench if it's missing? [yes; I'll ask before upgrading one]
 ```
 
+If `bench.local.env` exists next to `bench.sh` (your human saved values with
+`./bench.sh init`), read it first and put its values in as the defaults. It never holds
+the API key, so it's safe to read. Still ask every question; a saved value can be stale.
+
 What the answers mean:
 - **2 = no:** BetterBench runs elsewhere. Use `--env-file` ([below](#when-something-goes-wrong)).
 - **4 = yes:** wait until they say it's set. Check with `[ -n "$BETTERBENCH_API_KEY" ]`,
@@ -160,6 +164,11 @@ Notes that read unknown, and why:
 Every `bench.sh: warning:` needs fixing or an explanation before the real run. For
 `--X A but the launch command sets ...: declare --X B`, don't just switch to B: show it
 here and let your human decide. Rerun the dry run after any change.
+
+Once the values are confirmed, offer to save them, so the next run needs no typing:
+`./bench.sh init` writes `bench.local.env` (it refuses to overwrite one), then fill in
+the confirmed values. Ask before changing an existing file. After that the run is
+just `./bench.sh` plus `--dry-run` or `--full`.
 
 ### 7. Quick run
 

@@ -43,16 +43,22 @@ cat > "$d/bench.sh" <<'__BENCH_STANDARD_EOF__'
 #   --results-dir DIR    default: results/ next to bench.sh
 #   --env-file FILE      when BetterBench runs on another machine than the GPU:
 #                        the output of 'bench.sh collect-env' run on the GPU box
+#   --settings FILE      your saved values (default: bench.local.env next to
+#                        bench.sh, if it exists)
 #
 # Other commands:
+#   bench.sh init [FILE]       write a settings file to fill in once, so you
+#                              don't type the values every time
 #   bench.sh collect-env --endpoint URL --model ID   print the detected setup
 #   bench.sh power [SECONDS]   sample GPU power, energy and clock until killed
 #   bench.sh --version
 #
-# Values can also come from the environment: BENCH_TP, BENCH_PP, BENCH_QUANT,
-# BENCH_KV, BENCH_SPEC, BENCH_THINKING, BENCH_SUBMITTER, BENCH_POWER_LIMIT,
-# BENCH_PCIE, BENCH_MEM_BW, BENCH_SPECIAL_NOTES, BENCH_RESULTS_DIR. Machine-
-# local defaults like these go in bench.local.env next to bench.sh.
+# Saved values: bench.local.env (see 'bench.sh init') or the environment, as
+# BENCH_SUBMITTER, BENCH_ENDPOINT, BENCH_MODEL, BENCH_SERVER_CMD_FILE,
+# BENCH_TP, BENCH_PP, BENCH_QUANT, BENCH_KV, BENCH_SPEC, BENCH_THINKING,
+# BENCH_POWER_LIMIT, BENCH_PCIE, BENCH_MEM_BW, BENCH_SPECIAL_NOTES,
+# BENCH_RESULTS_DIR, BENCH_ENV_FILE. Flags win over the environment, which
+# wins over the file.
 # Send the whole results/<run>/ folder. Only --full runs count.
 # The standard models and their hashes: README.md. For agents: AGENTS.md.
 
@@ -63,8 +69,6 @@ umask 002
 here=$(cd "$(dirname "$0")" && pwd)
 home=${BENCH_HOME:-$here}
 . "$here/standard.env"
-# Machine-local defaults (e.g. BENCH_RESULTS_DIR), not part of the standard.
-[ -f "$home/bench.local.env" ] && . "$home/bench.local.env"
 
 die() { echo "bench.sh: $*" >&2; exit 1; }
 usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'; exit "${1:-0}"; }
@@ -96,13 +100,99 @@ trap 'on_signal 143' TERM
 # bg CMD...: run CMD in the background, wait for it; its status in $rc.
 bg() { "$@" & child=$!; rc=0; wait "$child" || rc=$?; child=""; }
 
+# The settings file people fill in once (bench.sh init writes it).
+settings_template() {
+  cat <<'EOF'
+# bench.local.env - your values for ./bench.sh, so you don't type them every
+# time. Fill in what's empty, then run just:  ./bench.sh   (or --dry-run, --full)
+#
+# One KEY=value per line; '#' starts a comment; quote values with spaces.
+# Relative paths are relative to this file. Flags on the command line win over
+# the environment, which wins over this file. Never put the API key here:
+# export BETTERBENCH_API_KEY in your shell instead.
+
+# --- you and your server -------------------------------------------------
+BENCH_SUBMITTER=                    # your name
+BENCH_ENDPOINT=http://localhost:8080/v1   # the server's base URL, ending in /v1
+BENCH_MODEL=                        # the id exactly as /v1/models lists it
+BENCH_SERVER_CMD_FILE=              # file with the server's launch command,
+                                    #   e.g. server-cmd.txt; empty behind llama-swap
+
+# --- what you declare (README: "What you declare") -----------------------
+BENCH_QUANT=                        # from the model table: Q4_K_M, UD-Q4_K_M or w4a16
+BENCH_KV=f16                        # f16, q8_0, q8_0/f16 (K/V differ), bf16, fp8
+BENCH_TP=1                          # tensor parallel size
+BENCH_PP=1                          # pipeline parallel size
+BENCH_SPEC=none                     # none, mtp:5, eagle3:4, ngram:4, draft:8
+BENCH_THINKING=default              # set on the server: default, off, on, low, medium, high
+
+# --- only when needed ----------------------------------------------------
+# BENCH_POWER_LIMIT=250             # when the GPU can't report it, or: stock
+# BENCH_PCIE="Gen4 x16"             # inside a VM
+# BENCH_MEM_BW=608                  # the card's spec memory bandwidth, GB/s
+# BENCH_SPECIAL_NOTES="undervolted"  # anything unusual
+# BENCH_RESULTS_DIR=results         # where run folders go
+# WARM_TIMEOUT=1800                 # a slow first model load behind llama-swap
+EOF
+}
+
+# load_settings FILE - set each KEY=value the environment doesn't set already.
+# Read as data, not run as shell code.
+loaded=""
+load_settings() {
+  sdir=$(cd "$(dirname "$1")" && pwd) n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line#"${line%%[![:space:]]*}"}
+    case $line in ''|'#'*) continue ;; esac
+    line=${line#export }
+    case $line in *=*) ;; *) die "$1 line $n: want KEY=value" ;; esac
+    key=${line%%=*} val=${line#*=}
+    case $key in ''|[0-9]*|*[!A-Z0-9_]*) die "$1 line $n: '$key' is not a variable name" ;; esac
+    [ "$key" != BETTERBENCH_API_KEY ] ||
+      die "$1 line $n: keep the API key out of files; export BETTERBENCH_API_KEY in your shell"
+    case $val in
+      \"*) val=${val#\"}; case $val in *\"*) val=${val%%\"*} ;; *) die "$1 line $n: missing closing quote" ;; esac ;;
+      \'*) val=${val#\'}; case $val in *\'*) val=${val%%\'*} ;; *) die "$1 line $n: missing closing quote" ;; esac ;;
+      *) val=${val%%[[:space:]]#*}; val=${val%"${val##*[![:space:]]}"} ;;
+    esac
+    # shellcheck disable=SC2088  # a literal ~/ in the file, expanded here
+    case $val in '~/'*) val=$HOME/${val#'~/'} ;; '$HOME/'*) val=$HOME/${val#'$HOME/'} ;; esac
+    case $key in *_FILE|*_DIR) case $val in /*|'') ;; *) val=$sdir/$val ;; esac ;; esac
+    eval "isset=\${$key+y}"
+    if [ -z "$isset" ]; then
+      eval "$key=\$val"; export "${key?}"
+      [ -z "$val" ] || loaded="$loaded $key"
+    fi
+  done < "$1"
+}
+
 case "${1:-}" in
+  init)
+    out=${2:-$home/bench.local.env}
+    [ ! -e "$out" ] || die "$out exists; edit it, or remove it first"
+    settings_template > "$out" || die "cannot write $out"
+    echo "wrote $out - fill in the empty values, then run ./bench.sh --dry-run"
+    exit 0 ;;
   collect-env) shift; rc=0; sh "$here/collect-env.sh" "$@" || rc=$?; exit "$rc" ;;
   power)       shift; bg sh "$here/gpu-power.sh" "$@"; exit "$rc" ;;
   --version)   echo "bench-standard $STANDARD_VERSION (BetterBench $BETTERBENCH_MIN_VERSION or newer)"; exit 0 ;;
 esac
 
-endpoint="" model="" server_cmd_file="" env_file="" quick=1 no_conc=0 dry=0 verbose=0
+# --settings is read before the other flags, so that they win over it.
+settings="" prev=""
+for a; do [ "$prev" = --settings ] && settings=$a; prev=$a; done
+if [ -n "$settings" ]; then
+  [ -f "$settings" ] && [ -r "$settings" ] || die "cannot read settings file $settings"
+  load_settings "$settings"
+elif [ -f "$home/bench.local.env" ]; then
+  settings=$home/bench.local.env
+  load_settings "$settings"
+fi
+[ -z "$loaded" ] || echo "settings from $settings:$loaded" >&2
+
+endpoint=${BENCH_ENDPOINT:-} model=${BENCH_MODEL:-} server_cmd_file=${BENCH_SERVER_CMD_FILE:-}
+env_file=${BENCH_ENV_FILE:-} quick=1 no_conc=0 dry=0 verbose=0
 tp=${BENCH_TP:-} pp=${BENCH_PP:-} quant=${BENCH_QUANT:-} kv=${BENCH_KV:-}
 spec=${BENCH_SPEC:-} thinking=${BENCH_THINKING:-} power_limit=${BENCH_POWER_LIMIT:-}
 submitter=${BENCH_SUBMITTER:-} pcie=${BENCH_PCIE:-} special=${BENCH_SPECIAL_NOTES:-}
@@ -118,6 +208,7 @@ while [ $# -gt 0 ]; do
     --server-cmd-file) need $# "$1"; server_cmd_file=$2; shift 2 ;;
     --env-file)        need $# "$1"; env_file=$2; shift 2 ;;
     --results-dir)     need $# "$1"; results_dir=$2; shift 2 ;;
+    --settings)        need $# "$1"; shift 2 ;;
     --tp)              need $# "$1"; tp=$2; shift 2 ;;
     --pp)              need $# "$1"; pp=$2; shift 2 ;;
     --quant)           need $# "$1"; quant=$2; shift 2 ;;
@@ -156,7 +247,8 @@ for f in endpoint model tp pp quant kv spec thinking submitter; do
   eval "v=\${$f}"
   [ -n "$v" ] || missing="$missing --$(printf '%s' "$f" | tr _ -)"
 done
-[ -z "$missing" ] || die "missing mandatory value(s):$missing"
+[ -z "$missing" ] || die "missing mandatory value(s):$missing" \
+  "(as flags, or saved in ${settings:-bench.local.env}; './bench.sh init' writes one to fill in)"
 
 matches "$tp" '[1-9][0-9]*'               || die "--tp must be a positive integer"
 matches "$pp" '[1-9][0-9]*'               || die "--pp must be a positive integer"

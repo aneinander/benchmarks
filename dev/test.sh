@@ -138,6 +138,46 @@ check "interrupted run folder marked, no done:" 'ls -d "$t"/res2/*.interrupted >
 check "no betterbench left running" '! pgrep -f "FAKE_BB_SLEEP|dev/test/betterbench run" >/dev/null 2>&1'
 check "helpers cleaned up after a signal" '[ -z "$(ls -A "$t/tmpdir")" ]'
 
+# ------------------------------------------------------------------ the settings file
+# plain bench.sh (no declared values on the command line) with BENCH_HOME=$t/home
+plain() { TMPDIR="$t/tmpdir" sh "$root/bench.sh" "$@" > "$t/out" 2>&1; }
+plain init; rc=$?
+check "init writes bench.local.env next to bench.sh" '[ $rc = 0 ] && grep -q "^BENCH_SUBMITTER=" "$t/home/bench.local.env"'
+plain init; rc=$?
+check "init doesn't overwrite" '[ $rc = 1 ] && grep -q "exists" "$t/out"'
+plain --dry-run
+check "an unfilled file names what's missing and how to save it" 'grep -q "missing mandatory value(s): --model --quant --submitter" "$t/out" && grep -q "bench.sh init" "$t/out"'
+s="$t/home/bench.local.env"
+sed -e "s|^BENCH_SUBMITTER=.*|BENCH_SUBMITTER=filer   # me|" \
+    -e "s|^BENCH_ENDPOINT=.*|BENCH_ENDPOINT=$LL|" -e "s|^BENCH_MODEL=.*|BENCH_MODEL=test-model|" \
+    -e "s|^BENCH_SERVER_CMD_FILE=.*|BENCH_SERVER_CMD_FILE=cmd.txt|" -e "s|^BENCH_QUANT=.*|BENCH_QUANT=Q4_K_M|" \
+    -e 's|^# BENCH_POWER_LIMIT=250 .*|export BENCH_POWER_LIMIT=200|' \
+    -e 's|^# BENCH_SPECIAL_NOTES=.*|BENCH_SPECIAL_NOTES="two words # not a comment"  # a comment|' \
+    -e 's|^# BENCH_RESULTS_DIR=.*|BENCH_RESULTS_DIR=res|' "$s" > "$s.new" && mv "$s.new" "$s"
+printf 'llama-server -m /m.gguf -ngl 99\n' > "$t/home/cmd.txt"
+(cd / && TMPDIR="$t/tmpdir" sh "$root/bench.sh" --dry-run > "$t/out" 2>&1); rc=$?
+python3 - "$t/out" > "$t/notes" <<'PY'
+import shlex, sys
+line = next((l for l in open(sys.argv[1]) if l.startswith("  betterbench")), "")
+w = shlex.split(line)
+print("\n".join(w[i + 1] for i, x in enumerate(w) if x == "--note"))
+PY
+check "a filled file runs with no flags at all" '[ $rc = 0 ] && grep -q "settings from .*bench.local.env: BENCH_SUBMITTER" "$t/out"'
+check "file: comments stripped, quotes kept, export accepted" '[ "$(note submitter)" = filer ] && [ "$(note special_notes)" = "two words # not a comment" ] && note power_limit | grep -q "^200 W"'
+check "file: relative paths are relative to the file" 'note launch | grep -q "ngl 99" && grep -q "would write $t/home/res/" "$t/out"'
+plain --dry-run --kv q8_0
+check "a flag wins over the file" 'grep -q "weights Q4_K_M · kv q8_0" "$t/out"'
+BENCH_SUBMITTER=envname plain --dry-run
+check "the environment wins over the file" 'grep -q "submitter=envname" "$t/out"'
+sed 's|^BENCH_SUBMITTER=.*|BENCH_SUBMITTER=other|' "$s" > "$t/home/other.env"
+plain --settings "$t/home/other.env" --dry-run
+check "--settings picks another file" 'grep -q "submitter=other" "$t/out"'
+printf 'BETTERBENCH_API_KEY=sk-x\n' > "$t/key.env"; plain --settings "$t/key.env" --dry-run; rc=$?
+check "an API key in the file is refused" '[ $rc = 1 ] && grep -q "keep the API key out of files" "$t/out"'
+printf 'BENCH_KV=$(touch %s/pwned)\n' "$t" > "$t/code.env"; plain --settings "$t/code.env" --dry-run
+check "the file is data, never run" '[ ! -e "$t/pwned" ]'
+rm -f "$s"
+
 # ------------------------------------------------------------------ power sampling
 f="$t/sys/bus/pci/drivers/amdgpu/0000:03:00.0/hwmon/hwmon1"; mkdir -p "$f"
 echo 150000000 > "$f/power1_input"; echo 2100000000 > "$f/freq1_input"
