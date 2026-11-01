@@ -9,23 +9,20 @@ What `bench.sh` records, how, and how it's built. For running it, see
    can take minutes.
 2. **Greedy check:** the same prompt 3 times at temperature 0.
 3. `collect-env.sh` (also `bench.sh collect-env`) detects the hardware and the engine, and measures memory bandwidth.
-4. BetterBench runs while `gpu-power.sh` (also `bench.sh power`) samples power, energy and the core and memory clocks every 2 s.
+4. BetterBench runs while `gpu-power.sh` (also `bench.sh power`) samples power, energy and clock every 2 s.
 5. A summary prints. Energy and % of bandwidth are written to `meta.json`.
 
 ## Files in a run folder
 
-`<run>` is the folder's name, `<YYMMDD>_<submitter>_<model>_<engine>_<N>x-<gpu>[_quick][_2]`
-with `N` = tp × pp; see the README.
-
 | file | what |
 |---|---|
-| `<run>.json` | BetterBench results; the notes below are under `env.notes` |
-| `<run>.html` | the standalone report |
+| `results.json` | BetterBench results; the notes below are under `env.notes` |
+| `results.html` | the standalone report |
 | `config.json` | the BetterBench config the run used |
-| `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run` |
+| `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run`, `warnings` |
+| `summary.txt` | the summary printed at the end, warnings included |
 | `server-cmd.txt` | the server launch command, secrets redacted |
-| `power.csv` | `epoch_s,watts,joules,mhz,mem_mhz` during the run |
-| `timeline.tsv` | when each BetterBench progress line appeared, for the energy per phase |
+| `power.csv` | `epoch_s,watts,joules,mhz` during the run |
 | `betterbench.log` | BetterBench's full output |
 
 ## Notes
@@ -36,22 +33,21 @@ can't be detected is left out or shows `unknown`.
 | note | example |
 |---|---|
 | `submitter` | `pascal` |
-| `gpu` | `1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395 · max 2800 MHz core · 19000 MHz mem` (VRAM per GPU, max clocks of the first) |
+| `gpu` | `1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395` (VRAM per GPU) |
 | `pcie` | `Gen4 x16 · ReBAR on`, `Gen1 x16 now, Gen4 x16 max · ReBAR on`, `unknown (VM) · ReBAR on` |
 | `power_limit` | `200 W`, or `180 W (GPU reports 200 W)` |
 | `host` | `AMD EPYC 7282 16-Core Processor · 60 GB RAM · Ubuntu 26.04.1 LTS · kernel 7.0.0-38-generic · VM kvm` |
 | `engine` | `llama.cpp b11913-7aca0d2ea · 4 slots · image ghcr.io/ggml-org/llama.cpp:server-intel@1a2b3c4d5e6f · via llama-swap` |
-| `model_file` | `/models/Qwen3.8-27B-UD-Q4_K_M.gguf · 16.46 GB · standard: Qwen3.8-27B UD-Q4_K_M`, `... · not a standard model (sha256 4f58a79550e8)` |
+| `model_file` | `/models/Qwen3.5-9B-Q4_K_M.gguf · 5.68 GB · sha256 03b74727a860 (standard: Qwen3.5-9B-Q4_K_M.gguf)` (weights as stored; `not a standard model` otherwise) |
 | `mem_bw` | `532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared` |
 | `parallel` | `tp 1 · pp 1` |
 | `precision` | `weights Q4_0 · kv f16` |
-| `max_ctx` | `412k tokens (engine KV cache) · 262k set` (vLLM), `≈ 181k tokens est. · 32k set · 9.1 GB free · 64 KiB/token` (llama.cpp) |
 | `launch` | `b 4096 · ub 1024 · fa on · ctk q8_0 · ctv q8_0 · ngl 99 · np 4` |
 | `env_flags` | `GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1`, or `none` |
 | `spec` | `mtp:5`, `none` |
 | `thinking` | `default · reasoning seen`, `off · no reasoning seen` (declared · observed) |
 | `greedy_check` | `identical 3/3 · 1d5105fe09dc`, `differs: 2 variants in 3 · first ...` |
-| `run` | `full · concurrency on · bench-standard 0.6.0 · betterbench 0.6.1`, or `... · betterbench 0.6.1 @ v0.6.1-3-gabc1234-dirty` for a build that isn't the release |
+| `run` | `full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1` |
 | `special_notes` | only when given |
 
 The context size appears as BetterBench's own chip.
@@ -59,21 +55,6 @@ The context size appears as BetterBench's own chip.
 ## How things are detected
 
 **GPU:** `nvidia-smi`, then `rocm-smi`, then `xpu-smi`.
-
-**Clocks:** the max core and memory clocks come from `nvidia-smi` (`clocks.max.*`), the
-driver's sysfs (xe/i915 `RP0`, amdgpu `pp_dpm_sclk`/`pp_dpm_mclk`) or `xpu-smi discovery`.
-The run samples the current ones. `xpu-smi` versions without a memory clock metric leave
-`mem_mhz` empty, and the rest of the sampling still works.
-
-**Max context** is the longest context this configuration holds in memory. vLLM logs its
-KV cache size in tokens ("GPU KV cache size: N tokens"), shared by all requests running at
-once. llama.cpp allocates the cache for `-c` when it loads, so this is an estimate: `-c`
-plus the VRAM still free (read after the warm-up, over all GPUs) over the KV bytes per
-token. Those come from the GGUF header and `-ctk`/`-ctv`: only layers whose cache grows
-with the context count. Recurrent layers (Mamba, linear attention) don't, and neither do
-sliding-window layers unless `--swa-full` is set. Compute buffers grow a little with the
-context too, so treat it as an upper bound. The note is left out when the model file
-can't be read on this machine.
 
 **PCIe** is the link into the slot. Cards with their own PCIe switch (Intel Arc, some AMD)
 are read at the switch's upstream port. Inside a VM the link can't be read: run
@@ -87,6 +68,15 @@ This works in a VM too, because passthrough keeps BAR sizes.
 launch command. For a docker server the image is recorded with its ID, because tags like
 `server-intel` move daily.
 
+**Model file:** the path the engine reports (`/props` `model_path`, vLLM's `root`). A path
+inside a docker container is mapped back to the host through the command's `-v` and
+`--mount` flags; a vLLM repo id is looked up in the Hugging Face cache (the container's
+`HF_HOME` through its mounts, then this machine's). The size is that of the GGUF (all
+parts of a split one) or of the `*.safetensors`. The hash is the one the README's table
+lists (split GGUFs aren't hashed); it's cached in `~/.cache/bench-standard/` by path,
+size and mtime. `dev/models.txt` holds the table; a hash not in it, or a `--quant` other
+than the table's, gives a warning.
+
 **Launch settings** come from the launch command, because no API reports them:
 - llama.cpp: `b`, `ub`, `fa`, `ctk` and `ctv` always show, as `default` when not set,
   because the defaults change between builds.
@@ -94,20 +84,12 @@ launch command. For a docker server the image is recorded with its ID, because t
 - **Env flags** come from `VAR=x cmd`, `env VAR=x` and docker `-e VAR=x`. Settings in
   llama-swap's `env:` block, or in the shell that started the server, aren't visible;
   put them in the command.
-- If `--kv` doesn't match the command, `bench.sh` warns.
-
-**Model file:** the path comes from the launch command. `model_hash.py` hashes it the
-way the README's Models section does (a GGUF file, or the `*.safetensors` of a
-directory) and looks the hash up in `models.tsv`. Not a standard model, or a `--quant`
-that differs from the table, gives a warning. Per-file hashes are cached in
-`~/.cache/bench-standard/sha256.tsv` by path, size and mtime, so only the first run
-waits (about a minute for 16 GB). `HASH_MODEL=0` skips it, and the note then reads
-`hash not checked`. When the server runs in docker, the path is the one inside the
-container. If that path doesn't exist on the host, the hash can't be checked either.
-
-**BetterBench build:** read from pip's record of where it was installed from: the git
-commit for `pip install git+...`, or `git describe` of the checkout for an editable
-install. A release tag adds nothing to the `run` note; a commit or `-dirty` does.
+- Declared values are checked against the command, and a contradiction is a warning
+  that names the value to declare: `--kv` (llama.cpp `-ctk`/`-ctv`, f16 when one is
+  unset; vLLM `--kv-cache-dtype`, or `--dtype` when that is `auto`), `--spec` (llama.cpp
+  `-md` with `--draft-max`, default 16; vLLM `--speculative-config`), `--thinking`
+  (`--reasoning-budget 0` or `enable_thinking: false` mean `off`) and, for vLLM, `--tp`
+  and `--pp`. Settings the command doesn't state aren't guessed.
 
 **Memory bandwidth:** `mem-bw.py` copies 1 GiB of random data with torch, inside the
 server's container (same GPU, env and torch), or with `$BW_PYTHON`. It uses random
@@ -128,23 +110,18 @@ tags in the text. `bench.sh` warns when `--thinking off` meets reasoning, or whe
 These go to `meta.json` under `post_run` and the summary, not to the notes, which are
 fixed before BetterBench starts.
 
-- **energy:** kJ, average and peak W, J per output token over the whole run, and
-  average, min and max core and memory clock. The clock counts only samples where the GPU is running.
+- **energy:** kJ, average and peak W, J per output token, and average, min and max clock.
+  Sampled with `nvidia-smi`, `xpu-smi`, or amdgpu's hwmon files in sysfs (power and
+  clock; no energy counter, so the power is integrated).
+  The clock counts only samples where the GPU is running. The figures cover the
+  **whole run**, warm-up and prefill included, so compare only runs of the same mode.
   Power is sampled only when BetterBench runs on the server. On a split setup, run
   `bench.sh power > power.csv` on the server yourself.
-- **energy per phase** (`energy.phases`): each BetterBench progress line is stamped in
-  `timeline.tsv`, and a piece of work lasts until the next line. That gives joules and
-  average W for decode (J per output token), prefill (J per 1000 prompt tokens) and each
-  concurrency level (J per token). The warm-up passes draw power but aren't in
-  the results, so their tokens are estimated from the measured passes of the same
-  piece (`tokens_incl_warmup_est`). These compare across quick and full runs; the
-  whole-run figure doesn't.
 - **roofline:** median batch-1 decode t/s × weight bytes ÷ memory bandwidth = % of
-  bandwidth. The weight bytes are what vLLM logs as loaded ("Model loading took X GiB",
-  per GPU, × tp), which is right for models quantized at load (fp8 from bf16 files reads
-  half of what's stored). Otherwise the stored size, without `*mtp*` files, since plain
-  decoding doesn't read an MTP head. With tp > 1 the bandwidth is per GPU × tp. It holds
-  for dense models; spec decoding and MoE can exceed 100%.
+  bandwidth. It holds for dense models. Spec decoding and MoE can exceed 100%. So
+  can models quantized at load (e.g. vLLM fp8 from bf16 files), because they read
+  fewer bytes than are stored. For safetensors the size includes every file, so the
+  RedHatAI models' MTP head adds about 5%.
 
 ## BetterBench with PR #4
 
@@ -157,20 +134,18 @@ mismatch between runs with and without the PR.
 ## Building
 
 People download only the root `bench.sh`. It's generated: `dev/build.sh` packs
-`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `gguf_kv.py`, `mem-bw.py`, `model_hash.py`,
-`notes.py`, `postrun.py`, `models.tsv`, `config.json` and `standard.env` into it. At run time it unpacks them to a temp dir and runs
-`dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
-and `bench.local.env` stay next to the downloaded file.
+`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `config.json`,
+`standard.env` and `models.txt` into it. At run time it unpacks them to a temp dir and
+exec's `dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
+and `bench.local.env` stay next to the downloaded file. `dev/bench.sh` removes the temp
+dir when it exits (`BENCH_UNPACKED`).
 
 ```sh
 sh dev/build.sh            # after any change in dev/; commit dev/ and bench.sh together
 sh dev/build.sh --check    # fails if bench.sh is out of date
+sh dev/test.sh             # end-to-end tests: fake server, fake BetterBench, no GPU
 sh dev/bench.sh --help     # dev/bench.sh also runs directly, results in dev/results/
-pytest dev/tests           # the notes, model hash and post-run figures
 ```
-
-CI (`.github/workflows/ci.yml`) runs shellcheck, `build.sh --check` and the tests.
-A model added to the README's table goes into `dev/models.tsv` too.
 
 BetterBench 0.6.1 is the oldest version that works (`BETTERBENCH_MIN_VERSION` in
 `standard.env`). Newer ones run too, and their version goes into the `run` note.

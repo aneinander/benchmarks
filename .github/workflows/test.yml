@@ -1,0 +1,17 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bench.sh is built from dev/
+        run: sh dev/build.sh --check
+      - name: shellcheck
+        run: shellcheck -s sh -S warning bench.sh dev/*.sh
+      - name: end-to-end tests (dash)
+        run: sh dev/test.sh
+      - name: end-to-end tests (bash as sh)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bashsh" && ln -s "$(command -v bash)" "$RUNNER_TEMP/bashsh/sh"
+          PATH="$RUNNER_TEMP/bashsh:$PATH" bash dev/test.sh

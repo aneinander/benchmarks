@@ -1,7 +1,8 @@
 #!/bin/sh
 # build.sh - pack dev/ into the one bench.sh at the repo root, which is all
-# people download. It unpacks the helpers to a temp dir and runs dev's
-# bench.sh from there, with results and bench.local.env next to itself.
+# people download. It unpacks the helpers to a temp dir and exec's dev's
+# bench.sh from there, with results and bench.local.env next to itself; that
+# script removes the temp dir (BENCH_UNPACKED) when it exits.
 #
 # usage: dev/build.sh          (then commit the root bench.sh with dev/)
 #        dev/build.sh --check  (exit 1 if the root bench.sh is out of date)
@@ -9,7 +10,7 @@
 set -eu
 dev=$(cd "$(dirname "$0")" && pwd)
 out="$dev/../bench.sh"
-files="bench.sh collect-env.sh gpu-power.sh gguf_kv.py mem-bw.py model_hash.py notes.py postrun.py models.tsv config.json standard.env"
+files="bench.sh collect-env.sh gpu-power.sh mem-bw.py config.json standard.env models.txt"
 eof=__BENCH_STANDARD_EOF__
 . "$dev/standard.env"
 
@@ -36,7 +37,8 @@ EOF
     cat "$dev/$f"
     printf '%s\n' "$eof"
   done
-  printf 'sh "$d/bench.sh" "$@"\n'
+  printf 'trap - EXIT INT TERM\n'
+  printf 'BENCH_UNPACKED=$d exec sh "$d/bench.sh" "$@"\n'
 } > "$tmp"
 
 if [ "${1:-}" = --check ]; then

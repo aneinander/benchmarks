@@ -11,7 +11,7 @@
 #   --server-cmd-file the launch command when not behind llama-swap (finds the container)
 # env: BETTERBENCH_API_KEY, PROBE_TIMEOUT (s, default 10), LOAD_TIMEOUT (s, default 600),
 #      MEASURE_BW=0 (skip the bandwidth test), BW_PYTHON (python with torch for it),
-#      HASH_MODEL=0 (skip hashing the model file)
+#      HASH_MODEL=0 (skip hashing the model file; hashes are cached by size and mtime)
 
 set -u
 LC_ALL=C; export LC_ALL
@@ -34,7 +34,9 @@ while [ $# -gt 0 ]; do
 done
 
 tmp=$(mktemp -d) || exit 1
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Header via a file so the key never shows up in `ps`.
 if [ -n "$api_key" ]; then printf 'Authorization: Bearer %s\n' "$api_key" > "$tmp/hdr"
 else printf 'Accept: application/json\n' > "$tmp/hdr"; fi
@@ -107,12 +109,47 @@ pcie_of() {
   return 0
 }
 
+# hostpath PATH - the host path behind a path inside the server's container,
+# from the -v / --mount flags of the launch command in $tmp/cmd; prints
+# nothing when no bind mount covers it.
+hostpath() {
+  [ -s "$tmp/cmd" ] && have python3 || return 0
+  python3 - "$tmp/cmd" "$1" <<'PY' 2>/dev/null
+import os, re, sys
+cmd, path = open(sys.argv[1], encoding="utf-8", errors="replace").read(), sys.argv[2]
+maps = re.findall(r'(?:^|\s)(?:-v|--volume)[ =](\S+?):(/[^\s:]*)', cmd)
+for m in re.finditer(r'--mount[ =](\S+)', cmd):
+    o = dict(p.split("=", 1) for p in m.group(1).split(",") if "=" in p)
+    src, dst = o.get("source") or o.get("src"), o.get("target") or o.get("destination") or o.get("dst")
+    if src and dst:
+        maps.append((src, dst))
+best = None
+for src, dst in maps:
+    dst = dst.rstrip("/") or "/"
+    src = os.path.expandvars(os.path.expanduser(src.strip("'\"")))
+    if src.startswith("/") and (path == dst or path.startswith(dst.rstrip("/") + "/")):
+        if best is None or len(dst) > len(best[1]):     # the innermost mount wins
+            best = (src, dst)
+if best:
+    print(best[0].rstrip("/") + path[len(best[1].rstrip("/")):])
+PY
+}
+
+# hf_snapshot HF_HOME REPO_ID - the snapshot dir of a Hugging Face cache entry
+hf_snapshot() {
+  r="$1/hub/models--$(printf '%s' "$2" | sed 's|/|--|g')"
+  [ -d "$r/snapshots" ] || return 1
+  if [ -f "$r/refs/main" ] && [ -d "$r/snapshots/$(cat "$r/refs/main")" ]; then
+    printf '%s\n' "$r/snapshots/$(cat "$r/refs/main")"
+  else
+    set -- "$r"/snapshots/*/
+    [ $# = 1 ] && [ -d "$1" ] && printf '%s\n' "${1%/}"
+  fi
+}
+
 # ---------------------------------------------------------------- GPU
 gpu_vendor=none gpu_model="" gpu_count=0 gpu_vram_gb="" gpu_driver="" gpu_power_limit_w="" gpu_bdf=""
-# Max clocks of the first GPU. VRAM used and total over all GPUs, read with
-# the model loaded (the warm-up ran), for the max context estimate.
-gpu_max_core_mhz="" gpu_max_mem_mhz="" gpu_vram_used_mib="" gpu_vram_total_mib=""
-if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,power.limit,pci.bus_id,clocks.max.gr,clocks.max.mem,memory.used \
+if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,power.limit,pci.bus_id \
                           --format=csv,noheader,nounits 2>/dev/null) && [ -n "$q" ]; then
   gpu_vendor=nvidia
   gpu_count=$(printf '%s\n' "$q" | grep -c .)
@@ -123,10 +160,6 @@ if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_versio
   gpu_power_limit_w=$(printf '%s' "$first" | cut -d, -f4 | awk '$1+0>0 {printf "%g", $1}')
   # 00000000:01:00.0 -> 0000:01:00.0
   gpu_bdf=$(printf '%s' "$first" | cut -d, -f5 | tr -d ' ' | tr 'A-F' 'a-f' | sed 's/^[0-9a-f]*\([0-9a-f]\{4\}:\)/\1/')
-  gpu_max_core_mhz=$(printf '%s' "$first" | cut -d, -f6 | awk '$1+0>0 {printf "%d", $1}')
-  gpu_max_mem_mhz=$(printf '%s' "$first" | cut -d, -f7 | awk '$1+0>0 {printf "%d", $1}')
-  gpu_vram_used_mib=$(printf '%s\n' "$q" | awk -F', *' '$8+0>0 {s += $8} END {if (s) printf "%d", s}')
-  gpu_vram_total_mib=$(printf '%s\n' "$q" | awk -F', *' '$2+0>0 {s += $2} END {if (s) printf "%d", s}')
 elif have rocm-smi && rocm-smi --showproductname --json > "$tmp/rp" 2>/dev/null; then
   gpu_vendor=amd
   rocm-smi --showmeminfo vram --json > "$tmp/rm" 2>/dev/null
@@ -138,8 +171,6 @@ elif have rocm-smi && rocm-smi --showproductname --json > "$tmp/rp" 2>/dev/null;
   gpu_model=$(jget "$tmp/rp" '"+".join(sorted({v.get("Card Series") or v.get("Card series") or v.get("Card model", "") for k, v in j.items() if k.startswith("card")}))' | norm_gpu)
   gpu_vram_gb=$(jget "$tmp/rm" 'round(int(next(v["VRAM Total Memory (B)"] for k, v in j.items() if k.startswith("card"))) / 2**30)')
   gpu_driver=$(jget "$tmp/rd" 'j["system"]["Driver version"]')
-  gpu_vram_used_mib=$(jget "$tmp/rm" 'sum(int(v["VRAM Total Used Memory (B)"]) for k, v in j.items() if k.startswith("card")) >> 20')
-  gpu_vram_total_mib=$(jget "$tmp/rm" 'sum(int(v["VRAM Total Memory (B)"]) for k, v in j.items() if k.startswith("card")) >> 20')
   gpu_power_limit_w=$(jget "$tmp/rw" '"%g" % float(next(v for k, v in next(c for n, c in j.items() if n.startswith("card")).items() if "Power" in k))')
 elif have xpu-smi && xpu-smi discovery -j > "$tmp/xl" 2>/dev/null; then
   gpu_vendor=intel
@@ -154,24 +185,7 @@ elif have xpu-smi && xpu-smi discovery -j > "$tmp/xl" 2>/dev/null; then
     # Newer xpu-smi takes named metrics; the old numeric -m syntax is gone.
     gpu_power_limit_w=$(xpu-smi dump --device "$dev0" --metrics power.limit --number 1 2>/dev/null \
                         | awk -F', *' 'NR>1 && $3+0>0 {printf "%g", $3; exit}')
-    # The memory clock key differs between xpu-smi versions: take what looks
-    # like one. The core clock comes from sysfs below.
-    gpu_max_mem_mhz=$(jget "$tmp/xd" 'next(int(float(v)) for k, v in j.items() if "mem" in k.lower() and ("clock" in k.lower() or "freq" in k.lower()) and float(v) > 0)')
-    gpu_vram_total_mib=$(jget "$tmp/xd" 'int(j["memory_physical_size_byte"]) >> 20')
   fi
-  case $gpu_count in [1-9]*) [ -n "$gpu_vram_total_mib" ] && gpu_vram_total_mib=$((gpu_vram_total_mib * gpu_count)) ;; esac
-  gpu_vram_used_mib=$(xpu-smi dump --device -1 --metrics memory.used --number 1 2>/dev/null |
-                      awk -F', *' 'NR>1 && $3+0>0 {s += $3} END {if (s) printf "%d", s}')
-fi
-# The driver knows the hardware's max core clock: xe and i915 directly,
-# amdgpu as its DPM levels (pp_dpm_*), which also list the memory clock.
-if [ -n "$gpu_bdf" ]; then
-  dev=/sys/bus/pci/devices/$gpu_bdf
-  [ -n "$gpu_max_core_mhz" ] || gpu_max_core_mhz=$(cat "$dev"/tile0/gt0/freq0/rp0_freq \
-    "$dev"/drm/card*/gt_RP0_freq_mhz 2>/dev/null | awk '$1+0>0 {print $1+0; exit}')
-  dpm_max() { sed -n 's/^[0-9]*: *\([0-9]*\)[Mm][Hh]z.*/\1/p' "$1" 2>/dev/null | sort -n | tail -n1; }
-  [ -n "$gpu_max_core_mhz" ] || gpu_max_core_mhz=$(dpm_max "$dev/pp_dpm_sclk")
-  [ -n "$gpu_max_mem_mhz" ] || gpu_max_mem_mhz=$(dpm_max "$dev/pp_dpm_mclk")
 fi
 [ -n "$gpu_count" ] || gpu_count=unknown
 
@@ -215,6 +229,7 @@ os=$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}") )
 kernel=$(uname -r 2>/dev/null)
 
 # ---------------------------------------------------------------- engine
+[ -n "$cmd_file" ] && cp "$cmd_file" "$tmp/cmd" 2>/dev/null
 proxy=none engine=unknown engine_version="" model_file="" ctx="" engine_slots=""
 if [ -n "$endpoint" ]; then
   base=${endpoint%/}; base=${base%/v1}
@@ -254,44 +269,77 @@ if [ -n "$endpoint" ]; then
     fi
   fi
 
-  # Behind llama-swap the launch command is known: keep it, and map a
-  # container path (-v HOST:/model) back to the host path.
+  # Behind llama-swap the launch command is known: keep it (it wins over
+  # --server-cmd-file for finding the container and the mounts).
   if [ "$proxy" = llama-swap ] && [ -n "$model" ] && fetch "$base/running" "$tmp/running"; then
     export JARG="$model"
-    jget "$tmp/running" 'next((r.get("cmd") for r in j["running"] if r.get("model") == arg), "")' > "$tmp/cmd"
-    if [ -s "$tmp/cmd" ]; then
+    jget "$tmp/running" 'next((r.get("cmd") for r in j["running"] if r.get("model") == arg), "")' > "$tmp/cmd.swap"
+    if [ -s "$tmp/cmd.swap" ]; then
+      mv "$tmp/cmd.swap" "$tmp/cmd"
       [ -n "$cmd_out" ] && cp "$tmp/cmd" "$cmd_out"
-      if [ -n "$model_file" ] && have python3; then
-        host=$(python3 - "$tmp/cmd" "$model_file" <<'PY' 2>/dev/null
-import re, sys
-cmd, path = open(sys.argv[1]).read(), sys.argv[2]
-for src, dst in re.findall(r'(?:-v|--volume)[ =](\S+?):(/[^\s:]*)', cmd):
-    if path == dst or path.startswith(dst.rstrip("/") + "/"):
-        print(src + path[len(dst):]); break
-PY
-)
-        [ -n "$host" ] && model_file=$host
-      fi
     fi
   fi
 fi
 
-# Weight bytes as stored: a single file, the parts of a split GGUF
-# (-00001-of-0000N.gguf), or the *.safetensors of a model directory, without
-# an MTP head (*mtp*), which plain decoding doesn't read.
-model_bytes=""
-if [ -f "$model_file" ]; then
-  case $model_file in
-    *-00001-of-[0-9]*.gguf) set -- "${model_file%-00001-of-*}"-[0-9]*-of-[0-9]*.gguf ;;
-    *) set -- "$model_file" ;;
+# model_path: where the weights are on this machine. The engine reports its
+# own view: a path inside its container (mapped back through -v / --mount),
+# or, for vLLM, often a Hugging Face repo id (looked up in the HF cache, the
+# container's and this machine's).
+model_path=""
+if [ -n "$model_file" ]; then
+  model_path=$(hostpath "$model_file")
+  [ -n "$model_path" ] && [ -e "$model_path" ] || model_path=$model_file
+  case $model_path in
+    /*|.*) ;;
+    */*) if [ ! -e "$model_path" ]; then
+           cenv=$( [ -s "$tmp/cmd" ] && tr '\n' ' ' < "$tmp/cmd" | sed -n 's/.*[ =]HF_HOME=\([^ ]*\).*/\1/p')
+           for root in $(hostpath "${cenv:-/root/.cache/huggingface}") $cenv \
+                       "${HF_HOME:-$HOME/.cache/huggingface}"; do
+             snap=$(hf_snapshot "$root" "$model_file") && { model_path=$snap; break; }
+           done
+         fi ;;
   esac
-  model_bytes=$(stat -c %s "$@" 2>/dev/null | awk '{s += $1} END {if (s) printf "%d", s}')
-elif [ -d "$model_file" ]; then
-  model_bytes=$(find "$model_file" -maxdepth 1 -name '*.safetensors' ! -name '*mtp*' -exec stat -c %s {} + 2>/dev/null |
-                awk '{s += $1} END {if (s) printf "%d", s}')
+  [ -e "$model_path" ] || model_path=""
 fi
 
-[ -s "$tmp/cmd" ] || { [ -n "$cmd_file" ] && cp "$cmd_file" "$tmp/cmd" 2>/dev/null; }
+# Weight bytes as stored: a single file, the parts of a split GGUF
+# (-00001-of-0000N.gguf), or the *.safetensors of a model directory. stat -L:
+# the HF cache keeps files as symlinks into blobs/.
+model_bytes="" model_sha256=""
+set --
+if [ -f "$model_path" ]; then
+  case $model_path in
+    *-00001-of-[0-9]*.gguf) set -- "${model_path%-00001-of-*}"-[0-9]*-of-[0-9]*.gguf ;;
+    *) set -- "$model_path" ;;
+  esac
+elif [ -d "$model_path" ]; then
+  set -- "$model_path"/*.safetensors
+  [ -e "$1" ] || set --
+fi
+[ $# -gt 0 ] && model_bytes=$(stat -L -c %s "$@" 2>/dev/null | awk '{s += $1} END {if (s) printf "%d", s}')
+
+# The hash the README's model table lists: sha256 of the GGUF, or of a repo's
+# per-file *.safetensors hashes in name order. Split GGUFs aren't hashed.
+# Cached by path, size and mtime, since hashing 15 GB takes a while.
+case $model_path in *-00001-of-[0-9]*.gguf) split=1 ;; *) split=0 ;; esac
+if [ "${HASH_MODEL:-1}" != 0 ] && [ -n "$model_bytes" ] && [ $split = 0 ] && have sha256sum; then
+  sig=$(stat -L -c '%n %s %Y' "$@" 2>/dev/null | cksum | cut -d' ' -f1)
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/bench-standard/model-sha256"
+  model_sha256=$(awk -v s="$sig" -v p="$model_path" -F '\t' '$1 == s && $2 == p {print $3; exit}' "$cache" 2>/dev/null)
+  if [ -z "$model_sha256" ]; then
+    echo "collect-env: hashing $model_path ($((model_bytes / 1000000000)) GB; once, it's cached; HASH_MODEL=0 skips) ..." >&2
+    if [ -f "$model_path" ]; then
+      model_sha256=$(sha256sum "$model_path" | cut -c1-64)
+    else
+      model_sha256=$(cd "$model_path" && sha256sum -- *.safetensors | sort -k2 | sha256sum | cut -c1-64)
+    fi
+    case $model_sha256 in
+      [0-9a-f]*) mkdir -p "${cache%/*}" 2>/dev/null &&
+                 printf '%s\t%s\t%s\n' "$sig" "$model_path" "$model_sha256" >> "$cache" 2>/dev/null ;;
+      *) model_sha256="" ;;
+    esac
+  fi
+fi
 # A docker server: the exact image, since tags like llama.cpp's server-intel
 # move daily (the llama.cpp build itself is in engine_version).
 container="" engine_image=""
@@ -302,40 +350,12 @@ if [ -n "$container" ] && have docker &&
   engine_image=$(printf '%s' "$i" | sed 's/@sha256:\(.\{12\}\).*/@\1/')
 fi
 
-# vLLM logs what the weights take in GPU memory, per worker. That beats the
-# stored size when it quantizes at load (fp8 from bf16 files reads half).
-# It also logs how many tokens its KV cache holds: the max context this
-# configuration fits, over all requests together.
-model_loaded_gib="" kv_cache_tokens=""
-if [ "$engine" = vllm ] && [ -n "$container" ] && have docker; then
-  docker logs "$container" > "$tmp/log" 2>&1
-  model_loaded_gib=$(sed -n 's/.*Model loading took \([0-9.]*\) GiB.*/\1/p' "$tmp/log" | tail -n1)
-  kv_cache_tokens=$(sed -n 's/.*GPU KV cache size: \([0-9,]*\) tokens.*/\1/p' "$tmp/log" | tail -n1 | tr -d ,)
-fi
-
-# llama.cpp allocates the KV cache for -c up front, so the max context is
-# estimated: what's set, plus free VRAM over the KV bytes per token. The
-# elements per token come from the GGUF header (notes.py applies -ctk/-ctv).
-kv_elems_per_token=""
-if [ "$engine" = llama.cpp ] && [ -f "$model_file" ] && have python3; then
-  kv_elems_per_token=$(python3 "$(cd "$(dirname "$0")" && pwd)/gguf_kv.py" "$model_file" 2>/dev/null)
-fi
-
-# The model's SHA256, checked against the standard models (README, Models).
-# The first time takes a while for a big file, then it's cached.
-# HASH_MODEL=0 skips it.
-model_sha256=""
-here=$(cd "$(dirname "$0")" && pwd)
-if [ "${HASH_MODEL:-1}" != 0 ] && [ -e "$model_file" ] && have python3; then
-  echo "collect-env: hashing the model file (cached after the first time) ..." >&2
-  model_sha256=$(python3 "$here/model_hash.py" "$model_file" 2>/dev/null)
-fi
-
 # Measured memory bandwidth, the base for "% of peak". mem-bw.py copies random
 # data with torch, inside the server's container (same GPU, env and torch), or
 # with $BW_PYTHON. Fallback: clpeak, whose test data may compress on Arc and
 # read high. A few seconds and 2 GiB of free VRAM; MEASURE_BW=0 skips it.
 gpu_mem_bw_gbs="" gpu_mem_bw_tool=""
+here=$(cd "$(dirname "$0")" && pwd)
 if [ "${MEASURE_BW:-1}" != 0 ]; then
   if [ -n "${BW_PYTHON:-}" ]; then
     r=$(timeout 300 "$BW_PYTHON" "$here/mem-bw.py" 2>/dev/null)
@@ -344,6 +364,7 @@ if [ "${MEASURE_BW:-1}" != 0 ]; then
   else
     r=""
   fi
+  case $r in [0-9]*' '[0-9]*) ;; *) r="" ;; esac   # "GBPS MIB", or nothing usable
   if [ -n "$r" ]; then
     gpu_mem_bw_gbs=${r% *} gpu_mem_bw_tool="torch copy, random, ${r#* } MiB"
   elif have clpeak && [ -n "$gpu_model" ]; then
@@ -367,10 +388,6 @@ kv gpu_vram_gb "$gpu_vram_gb"
 kv gpu_driver "$gpu_driver"
 kv gpu_power_limit_w "$gpu_power_limit_w"
 kv gpu_bdf "$gpu_bdf"
-kv gpu_max_core_mhz "$gpu_max_core_mhz"
-kv gpu_max_mem_mhz "$gpu_max_mem_mhz"
-kv gpu_vram_used_mib "$gpu_vram_used_mib"
-kv gpu_vram_total_mib "$gpu_vram_total_mib"
 kv pcie_link "$pcie_link"
 kv pcie_max "$pcie_max"
 kv gpu_bar_mib "$gpu_bar_mib"
@@ -388,10 +405,8 @@ kv engine_version "$engine_version"
 kv engine_slots "$engine_slots"
 kv engine_image "$engine_image"
 kv model_file "$model_file"
+kv model_path "$model_path"
 kv model_bytes "$model_bytes"
-kv model_loaded_gib "$model_loaded_gib"
 kv model_sha256 "$model_sha256"
 kv ctx "$ctx"
-kv kv_cache_tokens "$kv_cache_tokens"
-kv kv_elems_per_token "$kv_elems_per_token"
 exit 0
