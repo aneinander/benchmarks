@@ -19,7 +19,8 @@ What `bench.sh` records, how, and how it's built. For running it, see
 | `results.json` | BetterBench results; the notes below are under `env.notes` |
 | `results.html` | the standalone report |
 | `config.json` | the BetterBench config the run used |
-| `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run` |
+| `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run`, `warnings` |
+| `summary.txt` | the summary printed at the end, warnings included |
 | `server-cmd.txt` | the server launch command, secrets redacted |
 | `power.csv` | `epoch_s,watts,joules,mhz` during the run |
 | `betterbench.log` | BetterBench's full output |
@@ -37,7 +38,7 @@ can't be detected is left out or shows `unknown`.
 | `power_limit` | `200 W`, or `180 W (GPU reports 200 W)` |
 | `host` | `AMD EPYC 7282 16-Core Processor · 60 GB RAM · Ubuntu 26.04.1 LTS · kernel 7.0.0-38-generic · VM kvm` |
 | `engine` | `llama.cpp b11913-7aca0d2ea · 4 slots · image ghcr.io/ggml-org/llama.cpp:server-intel@1a2b3c4d5e6f · via llama-swap` |
-| `model_file` | `/models/Qwen3.8-27B-Q4_0.gguf · 15.60 GB` (weights as stored) |
+| `model_file` | `/models/Qwen3.5-9B-Q4_K_M.gguf · 5.68 GB · sha256 03b74727a860 (standard: Qwen3.5-9B-Q4_K_M.gguf)` (weights as stored; `not a standard model` otherwise) |
 | `mem_bw` | `532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared` |
 | `parallel` | `tp 1 · pp 1` |
 | `precision` | `weights Q4_0 · kv f16` |
@@ -46,7 +47,7 @@ can't be detected is left out or shows `unknown`.
 | `spec` | `mtp:5`, `none` |
 | `thinking` | `default · reasoning seen`, `off · no reasoning seen` (declared · observed) |
 | `greedy_check` | `identical 3/3 · 1d5105fe09dc`, `differs: 2 variants in 3 · first ...` |
-| `run` | `full · concurrency on · bench-standard 0.4.1 · betterbench 0.6.1` |
+| `run` | `full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1` |
 | `special_notes` | only when given |
 
 The context size appears as BetterBench's own chip.
@@ -67,6 +68,15 @@ This works in a VM too, because passthrough keeps BAR sizes.
 launch command. For a docker server the image is recorded with its ID, because tags like
 `server-intel` move daily.
 
+**Model file:** the path the engine reports (`/props` `model_path`, vLLM's `root`). A path
+inside a docker container is mapped back to the host through the command's `-v` and
+`--mount` flags; a vLLM repo id is looked up in the Hugging Face cache (the container's
+`HF_HOME` through its mounts, then this machine's). The size is that of the GGUF (all
+parts of a split one) or of the `*.safetensors`. The hash is the one the README's table
+lists (split GGUFs aren't hashed); it's cached in `~/.cache/bench-standard/` by path,
+size and mtime. `dev/models.txt` holds the table; a hash not in it, or a `--quant` other
+than the table's, gives a warning.
+
 **Launch settings** come from the launch command, because no API reports them:
 - llama.cpp: `b`, `ub`, `fa`, `ctk` and `ctv` always show, as `default` when not set,
   because the defaults change between builds.
@@ -74,7 +84,12 @@ launch command. For a docker server the image is recorded with its ID, because t
 - **Env flags** come from `VAR=x cmd`, `env VAR=x` and docker `-e VAR=x`. Settings in
   llama-swap's `env:` block, or in the shell that started the server, aren't visible;
   put them in the command.
-- If `--kv` doesn't match the command, `bench.sh` warns.
+- Declared values are checked against the command, and a contradiction is a warning
+  that names the value to declare: `--kv` (llama.cpp `-ctk`/`-ctv`, f16 when one is
+  unset; vLLM `--kv-cache-dtype`, or `--dtype` when that is `auto`), `--spec` (llama.cpp
+  `-md` with `--draft-max`, default 16; vLLM `--speculative-config`), `--thinking`
+  (`--reasoning-budget 0` or `enable_thinking: false` mean `off`) and, for vLLM, `--tp`
+  and `--pp`. Settings the command doesn't state aren't guessed.
 
 **Memory bandwidth:** `mem-bw.py` copies 1 GiB of random data with torch, inside the
 server's container (same GPU, env and torch), or with `$BW_PYTHON`. It uses random
@@ -96,6 +111,8 @@ These go to `meta.json` under `post_run` and the summary, not to the notes, whic
 fixed before BetterBench starts.
 
 - **energy:** kJ, average and peak W, J per output token, and average, min and max clock.
+  Sampled with `nvidia-smi`, `xpu-smi`, or amdgpu's hwmon files in sysfs (power and
+  clock; no energy counter, so the power is integrated).
   The clock counts only samples where the GPU is running. The figures cover the
   **whole run**, warm-up and prefill included, so compare only runs of the same mode.
   Power is sampled only when BetterBench runs on the server. On a split setup, run
@@ -117,14 +134,16 @@ mismatch between runs with and without the PR.
 ## Building
 
 People download only the root `bench.sh`. It's generated: `dev/build.sh` packs
-`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `config.json` and
-`standard.env` into it. At run time it unpacks them to a temp dir and runs
-`dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
-and `bench.local.env` stay next to the downloaded file.
+`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `config.json`,
+`standard.env` and `models.txt` into it. At run time it unpacks them to a temp dir and
+exec's `dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
+and `bench.local.env` stay next to the downloaded file. `dev/bench.sh` removes the temp
+dir when it exits (`BENCH_UNPACKED`).
 
 ```sh
 sh dev/build.sh            # after any change in dev/; commit dev/ and bench.sh together
 sh dev/build.sh --check    # fails if bench.sh is out of date
+sh dev/test.sh             # end-to-end tests: fake server, fake BetterBench, no GPU
 sh dev/bench.sh --help     # dev/bench.sh also runs directly, results in dev/results/
 ```
 

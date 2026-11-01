@@ -59,9 +59,36 @@ home=${BENCH_HOME:-$here}
 die() { echo "bench.sh: $*" >&2; exit 1; }
 usage() { sed -n '2,/^$/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'; exit "${1:-0}"; }
 
+# Cleanup and signals. Long steps run in the background with `wait`, which a
+# trapped signal interrupts at once (a foreground child would delay the trap
+# until it finished). Background jobs ignore Ctrl-C, so the trap stops them.
+# The one-file bench.sh hands its unpacked helpers over in BENCH_UNPACKED and
+# exec's this script, so a kill of that pid lands here.
+tmp="" child="" sampler="" run_dir_made=""
+cleanup() {
+  for p in $child $sampler; do kill "$p" 2>/dev/null || true; done
+  [ -z "$tmp" ] || rm -rf "$tmp"
+  [ "${BENCH_UNPACKED:-}" != "$here" ] || rm -rf "$here"
+}
+on_signal() {
+  trap - INT TERM
+  for p in $child; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+  child=""
+  if [ -n "$run_dir_made" ] && [ -d "$run_dir_made" ]; then
+    mv "$run_dir_made" "$run_dir_made.interrupted" 2>/dev/null &&
+      echo "bench.sh: interrupted; partial output in $run_dir_made.interrupted (it doesn't count)" >&2
+  fi
+  exit "$1"
+}
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+# bg CMD...: run CMD in the background, wait for it; its status in $rc.
+bg() { "$@" & child=$!; rc=0; wait "$child" || rc=$?; child=""; }
+
 case "${1:-}" in
-  collect-env) shift; exec sh "$here/collect-env.sh" "$@" ;;
-  power)       shift; exec sh "$here/gpu-power.sh" "$@" ;;
+  collect-env) shift; rc=0; sh "$here/collect-env.sh" "$@" || rc=$?; exit "$rc" ;;
+  power)       shift; bg sh "$here/gpu-power.sh" "$@"; exit "$rc" ;;
   --version)   echo "bench-standard $STANDARD_VERSION (BetterBench $BETTERBENCH_MIN_VERSION or newer)"; exit 0 ;;
 esac
 
@@ -141,7 +168,12 @@ if [ -n "$server_cmd_file" ]; then [ -r "$server_cmd_file" ] || die "cannot read
 if [ -n "$env_file" ]; then [ -r "$env_file" ] || die "cannot read $env_file"; fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# Warnings print as they come and are repeated after the summary, so none
+# scroll away during a long run; meta.json keeps them too.
+warnings="$tmp/warnings"
+: > "$warnings"
+warn() { echo "bench.sh: warning: $*" >&2; printf '%s\n' "$*" >> "$warnings"; }
 
 hdr="$tmp/hdr"
 if [ -n "${BETTERBENCH_API_KEY:-}" ]; then printf 'Authorization: Bearer %s\n' "$BETTERBENCH_API_KEY" > "$hdr"
@@ -196,6 +228,9 @@ else:
     print(f"greedy_variants={len(set(hashes))}\ngreedy_runs={len(hashes)}\ngreedy_hash={hashes[0]}")
     print("greedy_reasoning=" + ("yes" if all(thought) else "no" if not any(thought) else "mixed"))
 PY
+if grep -q '^greedy_check=failed' "$tmp/measured"; then
+  warn "greedy check failed ($(sed -n 's/^greedy_error=//p' "$tmp/measured")); the result has no greedy hash"
+fi
 
 # ---------------------------------------------------------------- collect
 if [ -n "$env_file" ]; then
@@ -245,8 +280,13 @@ if [ -n "$cmd_src" ]; then
   python3 - "$tmp/cmd" "$tmp/cmd.red" <<'PY'
 import re, sys
 s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-s = re.sub(r'(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY)[A-Z0-9_]*=)\S+', r'\1<redacted>', s)
-s = re.sub(r'(?i)(--(?:api-key|hf-token|token)[= ])\S+', r'\1<redacted>', s)
+# Env assignments (FOO_TOKEN=x, -e FOO_TOKEN=x, --env=FOO_TOKEN=x) - not
+# flags like --max-num-batched-tokens=8192, hence no '-' right before.
+s = re.sub(r'(?i)(?<![\w-])([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY|CREDENTIAL)'
+           r'[A-Z0-9_]*=)\S+', r'\1<redacted>', s)
+s = re.sub(r'(?i)((?<!\S)(?:--api-key|--hf-token|-hft|--token)[= ])\S+', r'\1<redacted>', s)
+# user:password@ in URLs (proxies, registries)
+s = re.sub(r'(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@', r'\1<redacted>@', s)
 open(sys.argv[2], "w", encoding="utf-8").write(s if s.endswith("\n") else s + "\n")
 PY
 fi
@@ -254,9 +294,14 @@ fi
 # The notes are grouped for reading: one chip per topic, nothing twice.
 # The context size is left out - BetterBench shows it from --max-model-len.
 # launch.json: the settings parsed from the launch command, for meta.json.
+WARNINGS=$warnings MODELS=$here/models.txt \
 python3 - "$tmp/mandatory" "$tmp/collected" "$tmp/measured" "$tmp/cmd.red" "$tmp/launch.json" \
   > "$tmp/notes" <<'PY'
-import json, shlex, sys
+import json, os, re, shlex, sys
+def warn(msg):
+    print("bench.sh: warning: " + msg, file=sys.stderr)
+    with open(os.environ["WARNINGS"], "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
 def kv(path):
     with open(path, encoding="utf-8") as f:
         return dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
@@ -269,7 +314,7 @@ def join(*parts):
     return " · ".join(p for p in parts if p) or "unknown"
 
 vendor = {"intel": "Intel", "nvidia": "NVIDIA", "amd": "AMD"}.get(g("gpu_vendor"), g("gpu_vendor"))
-count = g("gpu_count")
+count = g("gpu_count") if g("gpu_count") != "0" else ""   # 0: nothing detected
 gpu = join(" ".join(p for p in (count and count + "x", vendor if vendor != "none" else "",
                                 g("gpu_model")) if p),
            g("gpu_vram_gb") and g("gpu_vram_gb") + " GB",
@@ -308,7 +353,11 @@ env, flags, prog = {}, {}, None
 BOOL = {"--no-mmap", "--mlock", "--enforce-eager", "--enable-prefix-caching",
         "--no-enable-prefix-caching", "--enable-chunked-prefill",
         "--no-enable-chunked-prefill", "--cont-batching", "-cb", "--no-cont-batching", "-nocb",
-        "-cmoe", "--cpu-moe", "-rm", "--rm", "-d", "--detach", "-it", "-i", "--privileged"}
+        "-cmoe", "--cpu-moe", "-rm", "--rm", "-d", "--detach", "-it", "-i", "--privileged",
+        "--init", "--jinja", "--no-webui", "--metrics", "--trust-remote-code",
+        "--enable-auto-tool-choice", "--disable-log-requests", "--disable-log-stats"}
+def is_value(x):              # the next word is this flag's value: not a flag, or a number
+    return x is not None and (not x.startswith("-") or re.fullmatch(r"-[0-9.]+", x))
 FA_VALUES = {"on", "off", "auto", "1", "0", "true", "false"}
 i = 0
 while i < len(words):
@@ -332,7 +381,7 @@ while i < len(words):
                 flags[w] = nxt; i += 1
             else:
                 flags[w] = "on"                                   # older bare -fa
-        elif w in BOOL or nxt is None or nxt.startswith("-"):
+        elif w in BOOL or not is_value(nxt):
             flags[w] = True
         else:
             flags[w] = nxt; i += 1
@@ -388,15 +437,92 @@ env_flags = (" · ".join(f"{k}={v}" for k, v in env.items() if k not in QUIET) o
 json.dump({"engine": launch_kind or None, "settings": settings, "env": env, "flags": flags},
           open(sys.argv[5], "w", encoding="utf-8"), indent=2, default=str)
 
-# The declared --kv should be what the command sets.
-kvset = [x for x in (settings.get("ctk"), settings.get("ctv"), settings.get("kv-cache-dtype"))
-         if x and x not in ("default", "auto")]
-if kvset and m["kv"] not in kvset + ["/".join(kvset), "_".join(kvset)]:
-    print(f"bench.sh: warning: --kv {m['kv']} but the launch command sets "
-          f"{'/'.join(kvset)}", file=sys.stderr)
+# The declared values should be what the launch command sets (AGENTS.md
+# step 4). Only what the command states is checked; defaults are assumed
+# only where the standard defines them (llama.cpp KV f16, vLLM tp/pp 1).
+def expect(name, declared, wanted, why):
+    if wanted is not None and declared != wanted:
+        warn(f"--{name} {declared} but the launch command sets {why}: declare --{name} {wanted}")
 
+if cmd and launch_kind == "llama.cpp":
+    k, v = flag("-ctk", "--cache-type-k"), flag("-ctv", "--cache-type-v")
+    if k or v:
+        k, v = k or "f16", v or "f16"
+        expect("kv", m["kv"], k if k == v else f"{k}/{v}", f"K {k}, V {v}")
+elif cmd and launch_kind == "vllm":
+    kvd, dt = flag("--kv-cache-dtype"), str(flag("--dtype") or "")
+    if kvd and kvd != "auto":
+        expect("kv", m["kv"], kvd, f"--kv-cache-dtype {kvd}")
+    elif dt in ("bfloat16", "float16", "half"):
+        expect("kv", m["kv"], "bf16" if dt == "bfloat16" else "f16",
+               f"--kv-cache-dtype {kvd or 'unset'} with --dtype {dt}")
+
+# Speculative decoding.
+spec_cmd = None
+if cmd and launch_kind == "llama.cpp":
+    if flag("-md", "--model-draft", "-hfd", "-hfrd", "--hf-repo-draft"):
+        n = flag("--draft-max", "--draft", "--draft-n")
+        if n and str(n).isdigit():
+            spec_cmd = (f"draft:{n}", f"a draft model with --draft-max {n}")
+        elif not m["spec"].startswith("draft:"):   # the default N varies between builds
+            warn(f"--spec {m['spec']} but the launch command loads a draft model (-md):"
+                 " declare draft:N, N = the build's --draft-max default")
+    else:
+        spec_cmd = ("none", "no draft model")
+elif cmd and launch_kind == "vllm":
+    sc, n = flag("--speculative-config"), flag("--num-speculative-tokens")
+    if sc not in (None, True):
+        try:
+            j = json.loads(sc)
+        except ValueError:
+            j = dict(re.findall(r'"?(method|num_speculative_tokens|model)"?\s*[:=]\s*"?([\w./-]+)', sc))
+        meth = str(j.get("method") or ("draft" if j.get("model") else ""))
+        meth = ("mtp" if "mtp" in meth else "draft" if meth.startswith("draft") else
+                meth if meth in ("eagle", "eagle3", "ngram") else None)
+        n = j.get("num_speculative_tokens") or n
+        if meth and n:
+            spec_cmd = (f"{meth}:{n}", f"--speculative-config {sc}")
+    elif not flag("--speculative-model"):
+        spec_cmd = ("none", "no --speculative-config")
+if spec_cmd:
+    expect("spec", m["spec"], spec_cmd[0], spec_cmd[1])
+
+if cmd and launch_kind == "vllm":
+    expect("tp", m["tp"], str(flag("--tensor-parallel-size", "-tp") or 1), "that tensor parallel size")
+    expect("pp", m["pp"], str(flag("--pipeline-parallel-size", "-pp") or 1), "that pipeline parallel size")
+
+# Thinking switched off (or on) in the launch command.
+think_cmd = None
+if str(flag("--reasoning-budget")) == "0":
+    think_cmd = "--reasoning-budget 0"
+et = re.search(r'enable_thinking"?\s*:\s*(true|false)', cmd, re.I)
+if et:
+    think_cmd = think_cmd or f"enable_thinking: {et.group(1).lower()}"
+if think_cmd and ("false" in think_cmd or "budget 0" in think_cmd):
+    expect("thinking", m["thinking"], "off", think_cmd)
+elif think_cmd and m["thinking"] == "off":
+    warn(f"--thinking off but the launch command sets {think_cmd}")
+
+# Results only count for the standard models (models.txt = the README's table).
+std = {}
+with open(os.environ["MODELS"], encoding="utf-8") as f:
+    for line in f:
+        p = line.split()
+        if len(p) == 3 and not p[0].startswith("#"):
+            std[p[0]] = (p[1], p[2])
+sha = g("model_sha256")
+if sha in std:
+    sha_note = f"sha256 {sha[:12]} (standard: {std[sha][1]})"
+    if m["quant"] != std[sha][0]:
+        warn(f"--quant {m['quant']} but the model file is {std[sha][1]}: declare --quant {std[sha][0]}")
+elif sha:
+    sha_note = f"sha256 {sha[:12]} (not a standard model)"
+    warn(f"the model file (sha256 {sha[:12]}) is not one of the standard models in the README;"
+         " results only count for those files")
+else:
+    sha_note = ""
 mb = g("model_bytes")
-model_file = join(g("model_file"), mb and f"{int(mb) / 1e9:.2f} GB")
+model_file = join(g("model_file"), mb and f"{int(mb) / 1e9:.2f} GB", sha_note)
 mem_bw = join(g("gpu_mem_bw_gbs") and
               f'{g("gpu_mem_bw_gbs")} GB/s measured ({g("gpu_mem_bw_tool") or "?"})',
               m.get("mem_bw") and m["mem_bw"] + " GB/s declared")
@@ -413,11 +539,11 @@ seen = meas.get("greedy_reasoning")
 thinking = join(m["thinking"], {"yes": "reasoning seen", "no": "no reasoning seen",
                                 "mixed": "reasoning in some replies"}.get(seen, ""))
 if m["thinking"] == "off" and seen in ("yes", "mixed"):
-    print("bench.sh: warning: --thinking off, but the greedy replies contain reasoning;"
-          " check the server's chat template or reasoning flags", file=sys.stderr)
+    warn("--thinking off, but the greedy replies contain reasoning;"
+         " check the server's chat template or reasoning flags")
 elif m["thinking"] in ("on", "low", "medium", "high") and seen == "no":
-    print(f"bench.sh: warning: --thinking {m['thinking']}, but the greedy replies contain no"
-          " reasoning; thinking may be off on the server", file=sys.stderr)
+    warn(f"--thinking {m['thinking']}, but the greedy replies contain no"
+         " reasoning; thinking may be off on the server")
 
 eng = g("engine")
 engine = join(" ".join(p for p in (eng, g("engine_version")) if p),
@@ -451,10 +577,10 @@ for k, v in notes:
 PY
 
 engine=$(get engine) gpu=$(get gpu_model) count=$(get gpu_count) ctx=$(get ctx)
-[ "$engine" != unknown ] || echo "bench.sh: warning: engine not detected; result is hard to compare" >&2
+[ "$engine" != unknown ] || warn "engine not detected; result is hard to compare"
 if [ "$power_src" = declared ] && [ "$power_limit" != stock ] && matches "$pl" '[0-9.]+' &&
    [ "$(awk -v a="$pl" -v b="$power_limit" 'BEGIN{print (a-b>1||b-a>1)}')" = 1 ]; then
-  echo "bench.sh: warning: --power-limit $power_limit W but the GPU reports $pl W" >&2
+  warn "--power-limit $power_limit W but the GPU reports $pl W"
 fi
 matches "$count" '[2-9]|[1-9][0-9]+' && gpu="${count}x-$gpu"
 slug() { tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9.]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'; }
@@ -477,11 +603,16 @@ if [ $dry = 1 ]; then
   printf '  betterbench'
   for a; do case $a in *[[:space:]]*) printf " '%s'" "$a" ;; *) printf ' %s' "$a" ;; esac; done
   echo
+  if [ -s "$warnings" ]; then
+    echo "$(wc -l < "$warnings") warning(s) - fix or explain them before the real run:"
+    sed 's/^/  - /' "$warnings"
+  fi
   exit 0
 fi
 
 mkdir -p "$results_dir"
 mkdir "$run_dir" || die "cannot create $run_dir"
+run_dir_made=$run_dir
 cp "$here/config.json" "$run_dir/config.json"
 [ -n "$cmd_src" ] && cp "$tmp/cmd.red" "$run_dir/server-cmd.txt"
 
@@ -514,34 +645,66 @@ with open(sys.argv[3], "w", encoding="utf-8") as f:
 PY
 
 # Power is sampled where the GPU is: only when BetterBench runs on the server.
-sampler=""
+# The sampler exits at once when it finds nothing to read.
 if [ -z "$env_file" ]; then
   sh "$here/gpu-power.sh" 2 > "$run_dir/power.csv" 2>/dev/null &
   sampler=$!
-  trap 'kill "$sampler" 2>/dev/null || true; rm -rf "$tmp"' EXIT INT TERM
 fi
 echo "running betterbench -> $run_dir" >&2
 [ $verbose = 1 ] && sed 's/^/  note: /' "$tmp/notes" >&2
 t_start=$(date +%s.%N)
-# Full output always goes to betterbench.log; the terminal gets all of it
-# (--verbose) or the progress lines and anything that looks like trouble.
-{ PYTHONUNBUFFERED=1 betterbench "$@" 2>&1 || echo $? > "$tmp/bb_rc"; } |
-  tee "$run_dir/betterbench.log" |
-  if [ $verbose = 1 ]; then cat; else grep --line-buffered -E '^\[|^phases|warn|WARN|rror|Traceback' || true; fi >&2
-if [ -s "$tmp/bb_rc" ]; then
-  mv "$run_dir" "$run_dir.failed" 2>/dev/null || true
-  die "betterbench failed (exit $(cat "$tmp/bb_rc")); output in $run_dir.failed/betterbench.log"
-fi
+# Full output always goes to betterbench.log; the terminal follows it: all of
+# it (--verbose), or the progress lines and anything that looks like trouble.
+: > "$run_dir/betterbench.log"
+PYTHONUNBUFFERED=1 betterbench "$@" > "$run_dir/betterbench.log" 2>&1 &
+child=$!
+tail -n +1 -f --pid="$child" "$run_dir/betterbench.log" |
+  if [ $verbose = 1 ]; then cat; else grep --line-buffered -E '^\[|^phases|warn|WARN|rror|Traceback' || true; fi >&2 &
+follower=$!
+bb_rc=0
+wait "$child" || bb_rc=$?
+child=""
+wait "$follower" 2>/dev/null || true
 t_end=$(date +%s.%N)
 if [ -n "$sampler" ]; then
-  kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null || true
+  kill "$sampler" 2>/dev/null || true
+  wait "$sampler" 2>/dev/null || true
+  sampler=""
   [ -s "$run_dir/power.csv" ] || rm -f "$run_dir/power.csv"
 fi
+if [ "$bb_rc" != 0 ]; then
+  mv "$run_dir" "$run_dir.failed" 2>/dev/null || true
+  run_dir_made=""
+  die "betterbench failed (exit $bb_rc); output in $run_dir.failed/betterbench.log"
+fi
 
+# BetterBench with GGZ14/BetterBench#4 fingerprints PCIe and BAR itself
+# (env.gpu.pci), on the machine BetterBench runs on. Say so when that is not
+# the benchmarked GPU, or when it disagrees with collect-env.sh.
+ENV_FILE=$env_file WARNINGS=$warnings python3 - "$run_dir/results.json" "$tmp/collected" <<'PY' || true
+import json, os, sys
+pci = ((json.load(open(sys.argv[1], encoding="utf-8")).get("env") or {}).get("gpu") or {}).get("pci")
+if not pci:
+    sys.exit()
+with open(sys.argv[2], encoding="utf-8") as f:
+    c = dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
+bdf, rebar = c.get("gpu_bdf", "unknown"), c.get("rebar", "unknown")
+mine = next((g for g in pci if g.get("pci_address") == bdf), None)
+if mine is None:
+    where = "expected with --env-file" if os.environ["ENV_FILE"] else "different GPU or machine?"
+    print(f"bench.sh: note: BetterBench's own GPU fingerprint (env.gpu.pci) lists "
+          f"{', '.join(g.get('pci_address', '?') for g in pci)}, not the benchmarked GPU {bdf} "
+          f"({where}); the gpu/pcie notes describe the server", file=sys.stderr)
+elif rebar != "unknown" and mine.get("resizable_bar", "").split()[-1:] != [rebar]:
+    msg = (f"ReBAR {rebar} per collect-env.sh, but BetterBench reads "
+           f"{mine.get('resizable_bar')} ({mine.get('largest_bar_mib')} MiB BAR)")
+    print("bench.sh: warning: " + msg, file=sys.stderr)
+    open(os.environ["WARNINGS"], "a", encoding="utf-8").write(msg + "\n")
+PY
 # Energy per token and decode as % of memory bandwidth, from what the run
 # measured. They come after the run, so they go to meta.json ("post_run"),
 # not into the notes of results.json.
-T0=$t_start T1=$t_end python3 - "$run_dir" <<'PY' || echo "bench.sh: warning: post-run figures failed" >&2
+T0=$t_start T1=$t_end WARNINGS=$warnings python3 - "$run_dir" <<'PY' || warn "post-run figures failed"
 import json, os, statistics, sys
 d = sys.argv[1]
 res = json.load(open(f"{d}/results.json", encoding="utf-8"))
@@ -629,35 +792,21 @@ if "energy" in post:
     L.append(f"  power             avg {e['avg_w']} W, peak {e['peak_w']:.0f} W{clock}")
     L.append(f"  energy            {e['joules'] / 1000:.1f} kJ, "
              f"{e['j_per_output_token']} J per output token (whole run)")
+warnings = [w for w in open(os.environ["WARNINGS"], encoding="utf-8").read().splitlines() if w]
+if warnings:
+    L.append(f"  {len(warnings)} warning(s):")
+    L += [f"    - {w}" for w in warnings]
 print("\n" + "\n".join(L), file=sys.stderr)
+with open(f"{d}/summary.txt", "w", encoding="utf-8") as f:
+    f.write("\n".join(x[2:] for x in L) + "\n")
 
 meta["post_run"] = post
+meta["warnings"] = warnings
 with open(f"{d}/meta.json", "w", encoding="utf-8") as f:
     json.dump(meta, f, indent=2)
     f.write("\n")
 PY
 
-# BetterBench with GGZ14/BetterBench#4 fingerprints PCIe and BAR itself
-# (env.gpu.pci), on the machine BetterBench runs on. Say so when that is not
-# the benchmarked GPU, or when it disagrees with collect-env.sh.
-ENV_FILE=$env_file python3 - "$run_dir/results.json" "$tmp/collected" <<'PY' || true
-import json, os, sys
-pci = ((json.load(open(sys.argv[1], encoding="utf-8")).get("env") or {}).get("gpu") or {}).get("pci")
-if not pci:
-    sys.exit()
-with open(sys.argv[2], encoding="utf-8") as f:
-    c = dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
-bdf, rebar = c.get("gpu_bdf", "unknown"), c.get("rebar", "unknown")
-mine = next((g for g in pci if g.get("pci_address") == bdf), None)
-if mine is None:
-    where = "expected with --env-file" if os.environ["ENV_FILE"] else "different GPU or machine?"
-    print(f"bench.sh: note: BetterBench's own GPU fingerprint (env.gpu.pci) lists "
-          f"{', '.join(g.get('pci_address', '?') for g in pci)}, not the benchmarked GPU {bdf} "
-          f"({where}); the gpu/pcie notes describe the server", file=sys.stderr)
-elif rebar != "unknown" and mine.get("resizable_bar", "").split()[-1:] != [rebar]:
-    print(f"bench.sh: warning: ReBAR {rebar} per collect-env.sh, but BetterBench reads "
-          f"{mine.get('resizable_bar')} ({mine.get('largest_bar_mib')} MiB BAR)", file=sys.stderr)
-PY
 echo
 echo "done: $run_dir"
 ls -1 "$run_dir"

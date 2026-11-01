@@ -1,0 +1,7 @@
+# The standard models: results only count for these files. Same as the
+# README's model table; change both together and bump STANDARD_VERSION.
+# sha256 (a GGUF file, or a repo's *.safetensors as in the README)  --quant  name
+03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8  Q4_K_M     Qwen3.5-9B-Q4_K_M.gguf
+322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482  UD-Q4_K_M  Qwen3.8-27B-UD-Q4_K_M.gguf
+cca16f9855b9f92eee5876ddc8656ed6397316ffc65b9f17ca1939a9549e4c26  w4a16      RedHatAI/Qwen3.5-9B-quantized.w4a16
+bffa6b23fa11be557fe9de4b122a8bb99f537ad7a1a4effa702f7d0c677778f7  w4a16      RedHatAI/Qwen3.8-27B-INT4
