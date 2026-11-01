@@ -109,7 +109,10 @@ pcie_of() {
 
 # ---------------------------------------------------------------- GPU
 gpu_vendor=none gpu_model="" gpu_count=0 gpu_vram_gb="" gpu_driver="" gpu_power_limit_w="" gpu_bdf=""
-if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,power.limit,pci.bus_id \
+# Max clocks of the first GPU. VRAM used and total over all GPUs, read with
+# the model loaded (the warm-up ran), for the max context estimate.
+gpu_max_core_mhz="" gpu_max_mem_mhz="" gpu_vram_used_mib="" gpu_vram_total_mib=""
+if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,power.limit,pci.bus_id,clocks.max.gr,clocks.max.mem,memory.used \
                           --format=csv,noheader,nounits 2>/dev/null) && [ -n "$q" ]; then
   gpu_vendor=nvidia
   gpu_count=$(printf '%s\n' "$q" | grep -c .)
@@ -120,6 +123,10 @@ if have nvidia-smi && q=$(nvidia-smi --query-gpu=name,memory.total,driver_versio
   gpu_power_limit_w=$(printf '%s' "$first" | cut -d, -f4 | awk '$1+0>0 {printf "%g", $1}')
   # 00000000:01:00.0 -> 0000:01:00.0
   gpu_bdf=$(printf '%s' "$first" | cut -d, -f5 | tr -d ' ' | tr 'A-F' 'a-f' | sed 's/^[0-9a-f]*\([0-9a-f]\{4\}:\)/\1/')
+  gpu_max_core_mhz=$(printf '%s' "$first" | cut -d, -f6 | awk '$1+0>0 {printf "%d", $1}')
+  gpu_max_mem_mhz=$(printf '%s' "$first" | cut -d, -f7 | awk '$1+0>0 {printf "%d", $1}')
+  gpu_vram_used_mib=$(printf '%s\n' "$q" | awk -F', *' '$8+0>0 {s += $8} END {if (s) printf "%d", s}')
+  gpu_vram_total_mib=$(printf '%s\n' "$q" | awk -F', *' '$2+0>0 {s += $2} END {if (s) printf "%d", s}')
 elif have rocm-smi && rocm-smi --showproductname --json > "$tmp/rp" 2>/dev/null; then
   gpu_vendor=amd
   rocm-smi --showmeminfo vram --json > "$tmp/rm" 2>/dev/null
@@ -131,6 +138,8 @@ elif have rocm-smi && rocm-smi --showproductname --json > "$tmp/rp" 2>/dev/null;
   gpu_model=$(jget "$tmp/rp" '"+".join(sorted({v.get("Card Series") or v.get("Card series") or v.get("Card model", "") for k, v in j.items() if k.startswith("card")}))' | norm_gpu)
   gpu_vram_gb=$(jget "$tmp/rm" 'round(int(next(v["VRAM Total Memory (B)"] for k, v in j.items() if k.startswith("card"))) / 2**30)')
   gpu_driver=$(jget "$tmp/rd" 'j["system"]["Driver version"]')
+  gpu_vram_used_mib=$(jget "$tmp/rm" 'sum(int(v["VRAM Total Used Memory (B)"]) for k, v in j.items() if k.startswith("card")) >> 20')
+  gpu_vram_total_mib=$(jget "$tmp/rm" 'sum(int(v["VRAM Total Memory (B)"]) for k, v in j.items() if k.startswith("card")) >> 20')
   gpu_power_limit_w=$(jget "$tmp/rw" '"%g" % float(next(v for k, v in next(c for n, c in j.items() if n.startswith("card")).items() if "Power" in k))')
 elif have xpu-smi && xpu-smi discovery -j > "$tmp/xl" 2>/dev/null; then
   gpu_vendor=intel
@@ -145,7 +154,24 @@ elif have xpu-smi && xpu-smi discovery -j > "$tmp/xl" 2>/dev/null; then
     # Newer xpu-smi takes named metrics; the old numeric -m syntax is gone.
     gpu_power_limit_w=$(xpu-smi dump --device "$dev0" --metrics power.limit --number 1 2>/dev/null \
                         | awk -F', *' 'NR>1 && $3+0>0 {printf "%g", $3; exit}')
+    # The memory clock key differs between xpu-smi versions: take what looks
+    # like one. The core clock comes from sysfs below.
+    gpu_max_mem_mhz=$(jget "$tmp/xd" 'next(int(float(v)) for k, v in j.items() if "mem" in k.lower() and ("clock" in k.lower() or "freq" in k.lower()) and float(v) > 0)')
+    gpu_vram_total_mib=$(jget "$tmp/xd" 'int(j["memory_physical_size_byte"]) >> 20')
   fi
+  case $gpu_count in [1-9]*) [ -n "$gpu_vram_total_mib" ] && gpu_vram_total_mib=$((gpu_vram_total_mib * gpu_count)) ;; esac
+  gpu_vram_used_mib=$(xpu-smi dump --device -1 --metrics memory.used --number 1 2>/dev/null |
+                      awk -F', *' 'NR>1 && $3+0>0 {s += $3} END {if (s) printf "%d", s}')
+fi
+# The driver knows the hardware's max core clock: xe and i915 directly,
+# amdgpu as its DPM levels (pp_dpm_*), which also list the memory clock.
+if [ -n "$gpu_bdf" ]; then
+  dev=/sys/bus/pci/devices/$gpu_bdf
+  [ -n "$gpu_max_core_mhz" ] || gpu_max_core_mhz=$(cat "$dev"/tile0/gt0/freq0/rp0_freq \
+    "$dev"/drm/card*/gt_RP0_freq_mhz 2>/dev/null | awk '$1+0>0 {print $1+0; exit}')
+  dpm_max() { sed -n 's/^[0-9]*: *\([0-9]*\)[Mm][Hh]z.*/\1/p' "$1" 2>/dev/null | sort -n | tail -n1; }
+  [ -n "$gpu_max_core_mhz" ] || gpu_max_core_mhz=$(dpm_max "$dev/pp_dpm_sclk")
+  [ -n "$gpu_max_mem_mhz" ] || gpu_max_mem_mhz=$(dpm_max "$dev/pp_dpm_mclk")
 fi
 [ -n "$gpu_count" ] || gpu_count=unknown
 
@@ -278,9 +304,21 @@ fi
 
 # vLLM logs what the weights take in GPU memory, per worker. That beats the
 # stored size when it quantizes at load (fp8 from bf16 files reads half).
-model_loaded_gib=""
+# It also logs how many tokens its KV cache holds: the max context this
+# configuration fits, over all requests together.
+model_loaded_gib="" kv_cache_tokens=""
 if [ "$engine" = vllm ] && [ -n "$container" ] && have docker; then
-  model_loaded_gib=$(docker logs "$container" 2>&1 | sed -n 's/.*Model loading took \([0-9.]*\) GiB.*/\1/p' | tail -n1)
+  docker logs "$container" > "$tmp/log" 2>&1
+  model_loaded_gib=$(sed -n 's/.*Model loading took \([0-9.]*\) GiB.*/\1/p' "$tmp/log" | tail -n1)
+  kv_cache_tokens=$(sed -n 's/.*GPU KV cache size: \([0-9,]*\) tokens.*/\1/p' "$tmp/log" | tail -n1 | tr -d ,)
+fi
+
+# llama.cpp allocates the KV cache for -c up front, so the max context is
+# estimated: what's set, plus free VRAM over the KV bytes per token. The
+# elements per token come from the GGUF header (notes.py applies -ctk/-ctv).
+kv_elems_per_token=""
+if [ "$engine" = llama.cpp ] && [ -f "$model_file" ] && have python3; then
+  kv_elems_per_token=$(python3 "$(cd "$(dirname "$0")" && pwd)/gguf_kv.py" "$model_file" 2>/dev/null)
 fi
 
 # The model's SHA256, checked against the standard models (README, Models).
@@ -329,6 +367,10 @@ kv gpu_vram_gb "$gpu_vram_gb"
 kv gpu_driver "$gpu_driver"
 kv gpu_power_limit_w "$gpu_power_limit_w"
 kv gpu_bdf "$gpu_bdf"
+kv gpu_max_core_mhz "$gpu_max_core_mhz"
+kv gpu_max_mem_mhz "$gpu_max_mem_mhz"
+kv gpu_vram_used_mib "$gpu_vram_used_mib"
+kv gpu_vram_total_mib "$gpu_vram_total_mib"
 kv pcie_link "$pcie_link"
 kv pcie_max "$pcie_max"
 kv gpu_bar_mib "$gpu_bar_mib"
@@ -350,4 +392,6 @@ kv model_bytes "$model_bytes"
 kv model_loaded_gib "$model_loaded_gib"
 kv model_sha256 "$model_sha256"
 kv ctx "$ctx"
+kv kv_cache_tokens "$kv_cache_tokens"
+kv kv_elems_per_token "$kv_elems_per_token"
 exit 0

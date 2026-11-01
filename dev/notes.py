@@ -25,7 +25,9 @@ count = g("gpu_count")
 gpu = join(" ".join(p for p in (count and count + "x", vendor if vendor != "none" else "",
                                 g("gpu_model")) if p),
            g("gpu_vram_gb") and g("gpu_vram_gb") + " GB",
-           g("gpu_driver") and "driver " + g("gpu_driver"))
+           g("gpu_driver") and "driver " + g("gpu_driver"),
+           g("gpu_max_core_mhz") and "max " + g("gpu_max_core_mhz") + " MHz core",
+           g("gpu_max_mem_mhz") and g("gpu_max_mem_mhz") + " MHz mem")
 
 link, top = g("pcie_link"), g("pcie_max")
 if m.get("pcie"):
@@ -165,6 +167,30 @@ model_file = join(g("model_file"), mb and f"{int(mb) / 1e9:.2f} GB", check)
 mem_bw = join(g("gpu_mem_bw_gbs") and
               f'{g("gpu_mem_bw_gbs")} GB/s measured ({g("gpu_mem_bw_tool") or "?"})',
               m.get("mem_bw") and m["mem_bw"] + " GB/s declared")
+# The longest context this configuration holds. vLLM logs its KV cache in
+# tokens. llama.cpp allocates the cache for -c up front, so estimate: what's
+# set, plus the VRAM still free over the KV bytes per token of -ctk/-ctv.
+# Sliding-window layers keep a fixed cache unless --swa-full.
+KV_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+            "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
+def kilo(n):
+    return f"{n / 1000:.0f}k" if n >= 10000 else f"{n:,}"
+ctx = int(g("ctx")) if g("ctx").isdigit() else None
+max_ctx = None
+if g("kv_cache_tokens").isdigit():
+    max_ctx = join(kilo(int(g("kv_cache_tokens"))) + " tokens (engine KV cache)", ctx and kilo(ctx) + " set")
+elif g("kv_elems_per_token") and ctx and g("gpu_vram_used_mib").isdigit() and g("gpu_vram_total_mib").isdigit():
+    ek, ev, sk, sv = (int(x) for x in g("kv_elems_per_token").split())
+    if "--swa-full" in flags:
+        ek, ev = ek + sk, ev + sv
+    bk = KV_BYTES.get(str(settings.get("ctk", "f16")).replace("default", "f16"))
+    bv = KV_BYTES.get(str(settings.get("ctv", "f16")).replace("default", "f16"))
+    free = (int(g("gpu_vram_total_mib")) - int(g("gpu_vram_used_mib"))) * 2**20
+    if bk and bv and ek + ev:
+        per = ek * bk + ev * bv
+        max_ctx = join("≈ " + kilo(ctx + int(max(free, 0) / per)) + " tokens est.", kilo(ctx) + " set",
+                       f"{free / 1e9:.1f} GB free", f"{per / 1024:.0f} KiB/token")
+
 if meas.get("greedy_check") == "identical":
     greedy = f'identical {meas["greedy_runs"]}/{meas["greedy_runs"]} · {meas["greedy_hash"]}'
 elif meas.get("greedy_check") == "differs":
@@ -208,6 +234,7 @@ notes = [
     ("mem_bw", mem_bw),
     ("parallel", f"tp {m['tp']} · pp {m['pp']}"),
     ("precision", f"weights {m['quant']} · kv {m['kv']}"),
+    ("max_ctx", max_ctx),
     ("launch", launch),
     ("env_flags", env_flags),
     ("spec", m["spec"]),
@@ -219,4 +246,5 @@ notes = [
 if m.get("special_notes"):
     notes.append(("special_notes", m["special_notes"]))
 for k, v in notes:
-    print(f"{k}={v}")
+    if v:
+        print(f"{k}={v}")

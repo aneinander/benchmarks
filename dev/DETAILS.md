@@ -9,7 +9,7 @@ What `bench.sh` records, how, and how it's built. For running it, see
    can take minutes.
 2. **Greedy check:** the same prompt 3 times at temperature 0.
 3. `collect-env.sh` (also `bench.sh collect-env`) detects the hardware and the engine, and measures memory bandwidth.
-4. BetterBench runs while `gpu-power.sh` (also `bench.sh power`) samples power, energy and clock every 2 s.
+4. BetterBench runs while `gpu-power.sh` (also `bench.sh power`) samples power, energy and the core and memory clocks every 2 s.
 5. A summary prints. Energy and % of bandwidth are written to `meta.json`.
 
 ## Files in a run folder
@@ -24,7 +24,7 @@ with `N` = tp × pp; see the README.
 | `config.json` | the BetterBench config the run used |
 | `meta.json` | every raw value: `mandatory` (declared), `collected` (detected), `measured`, `launch`, `post_run` |
 | `server-cmd.txt` | the server launch command, secrets redacted |
-| `power.csv` | `epoch_s,watts,joules,mhz` during the run |
+| `power.csv` | `epoch_s,watts,joules,mhz,mem_mhz` during the run |
 | `timeline.tsv` | when each BetterBench progress line appeared, for the energy per phase |
 | `betterbench.log` | BetterBench's full output |
 
@@ -36,7 +36,7 @@ can't be detected is left out or shows `unknown`.
 | note | example |
 |---|---|
 | `submitter` | `pascal` |
-| `gpu` | `1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395` (VRAM per GPU) |
+| `gpu` | `1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395 · max 2800 MHz core · 19000 MHz mem` (VRAM per GPU, max clocks of the first) |
 | `pcie` | `Gen4 x16 · ReBAR on`, `Gen1 x16 now, Gen4 x16 max · ReBAR on`, `unknown (VM) · ReBAR on` |
 | `power_limit` | `200 W`, or `180 W (GPU reports 200 W)` |
 | `host` | `AMD EPYC 7282 16-Core Processor · 60 GB RAM · Ubuntu 26.04.1 LTS · kernel 7.0.0-38-generic · VM kvm` |
@@ -45,12 +45,13 @@ can't be detected is left out or shows `unknown`.
 | `mem_bw` | `532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared` |
 | `parallel` | `tp 1 · pp 1` |
 | `precision` | `weights Q4_0 · kv f16` |
+| `max_ctx` | `412k tokens (engine KV cache) · 262k set` (vLLM), `≈ 181k tokens est. · 32k set · 9.1 GB free · 64 KiB/token` (llama.cpp) |
 | `launch` | `b 4096 · ub 1024 · fa on · ctk q8_0 · ctv q8_0 · ngl 99 · np 4` |
 | `env_flags` | `GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1`, or `none` |
 | `spec` | `mtp:5`, `none` |
 | `thinking` | `default · reasoning seen`, `off · no reasoning seen` (declared · observed) |
 | `greedy_check` | `identical 3/3 · 1d5105fe09dc`, `differs: 2 variants in 3 · first ...` |
-| `run` | `full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1`, or `... · betterbench 0.6.1 @ v0.6.1-3-gabc1234-dirty` for a build that isn't the release |
+| `run` | `full · concurrency on · bench-standard 0.6.0 · betterbench 0.6.1`, or `... · betterbench 0.6.1 @ v0.6.1-3-gabc1234-dirty` for a build that isn't the release |
 | `special_notes` | only when given |
 
 The context size appears as BetterBench's own chip.
@@ -58,6 +59,21 @@ The context size appears as BetterBench's own chip.
 ## How things are detected
 
 **GPU:** `nvidia-smi`, then `rocm-smi`, then `xpu-smi`.
+
+**Clocks:** the max core and memory clocks come from `nvidia-smi` (`clocks.max.*`), the
+driver's sysfs (xe/i915 `RP0`, amdgpu `pp_dpm_sclk`/`pp_dpm_mclk`) or `xpu-smi discovery`.
+The run samples the current ones. `xpu-smi` versions without a memory clock metric leave
+`mem_mhz` empty, and the rest of the sampling still works.
+
+**Max context** is the longest context this configuration holds in memory. vLLM logs its
+KV cache size in tokens ("GPU KV cache size: N tokens"), shared by all requests running at
+once. llama.cpp allocates the cache for `-c` when it loads, so this is an estimate: `-c`
+plus the VRAM still free (read after the warm-up, over all GPUs) over the KV bytes per
+token. Those come from the GGUF header and `-ctk`/`-ctv`: only layers whose cache grows
+with the context count. Recurrent layers (Mamba, linear attention) don't, and neither do
+sliding-window layers unless `--swa-full` is set. Compute buffers grow a little with the
+context too, so treat it as an upper bound. The note is left out when the model file
+can't be read on this machine.
 
 **PCIe** is the link into the slot. Cards with their own PCIe switch (Intel Arc, some AMD)
 are read at the switch's upstream port. Inside a VM the link can't be read: run
@@ -113,7 +129,7 @@ These go to `meta.json` under `post_run` and the summary, not to the notes, whic
 fixed before BetterBench starts.
 
 - **energy:** kJ, average and peak W, J per output token over the whole run, and
-  average, min and max clock. The clock counts only samples where the GPU is running.
+  average, min and max core and memory clock. The clock counts only samples where the GPU is running.
   Power is sampled only when BetterBench runs on the server. On a split setup, run
   `bench.sh power > power.csv` on the server yourself.
 - **energy per phase** (`energy.phases`): each BetterBench progress line is stamped in
@@ -141,7 +157,7 @@ mismatch between runs with and without the PR.
 ## Building
 
 People download only the root `bench.sh`. It's generated: `dev/build.sh` packs
-`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `mem-bw.py`, `model_hash.py`,
+`dev/bench.sh`, `collect-env.sh`, `gpu-power.sh`, `gguf_kv.py`, `mem-bw.py`, `model_hash.py`,
 `notes.py`, `postrun.py`, `models.tsv`, `config.json` and `standard.env` into it. At run time it unpacks them to a temp dir and runs
 `dev/bench.sh` from there, with `BENCH_HOME` set to its own folder, so `results/`
 and `bench.local.env` stay next to the downloaded file.

@@ -3,7 +3,7 @@
 usage: T0=epoch T1=epoch postrun.py RUN_DIR [RESULTS_JSON]
 
 Reads RESULTS_JSON (default RUN_DIR/results.json), and meta.json, power.csv
-(epoch_s,watts,joules,mhz) and timeline.tsv (epoch<TAB>BetterBench progress
+(epoch_s,watts,joules,mhz[,mem_mhz]) and timeline.tsv (epoch<TAB>BetterBench progress
 line) from RUN_DIR. Writes
 energy (whole run and per phase) and the bandwidth figure to meta.json under
 "post_run", and prints the summary to stderr.
@@ -23,7 +23,8 @@ def read_power(path):
             p = line.strip().split(",")
             try:
                 rows.append((float(p[0]), float(p[1]), float(p[2]) if p[2] else None,
-                             float(p[3]) if len(p) > 3 and p[3] else 0.0))
+                             float(p[3]) if len(p) > 3 and p[3] else 0.0,
+                             float(p[4]) if len(p) > 4 and p[4] else 0.0))
             except (ValueError, IndexError):
                 pass
     return rows
@@ -182,6 +183,10 @@ def main(d, results=None):
         if clk:
             e.update(avg_mhz=round(statistics.mean(clk)), min_mhz=round(min(clk)),
                      max_mhz=round(max(clk)), clock_samples=f"{len(clk)}/{len(rows)}")
+        mem = [r[4] for r in rows if r[4] > 0]
+        if mem:
+            e.update(avg_mem_mhz=round(statistics.mean(mem)), min_mem_mhz=round(min(mem)),
+                     max_mem_mhz=round(max(mem)))
         if timeline:
             e["phases"] = phase_energy(res, rows, timeline, t1)
         post["energy"] = e
@@ -219,6 +224,8 @@ def main(d, results=None):
         e = post["energy"]
         clock = (f" · clock avg {e['avg_mhz']} MHz ({e['min_mhz']}-{e['max_mhz']})"
                  if "avg_mhz" in e else "")
+        if "avg_mem_mhz" in e:
+            clock += f" · mem {e['avg_mem_mhz']} MHz ({e['min_mem_mhz']}-{e['max_mem_mhz']})"
         L.append(f"  power             avg {e['avg_w']} W, peak {e['peak_w']:.0f} W{clock}")
         ph = e.get("phases") or {}
         parts = []

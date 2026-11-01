@@ -132,30 +132,33 @@ file next to `bench.sh`.
    identical. Its hash lets you compare setups: the same model and quant should give
    the same text everywhere. The replies also show whether the model reasoned, and
    `bench.sh` warns if that contradicts your `--thinking`.
-3. **Detection:** GPU, driver, power limit, PCIe link and ReBAR, CPU, RAM, OS, the
+3. **Detection:** GPU, driver, max clocks, power limit, PCIe link and ReBAR, CPU, RAM, OS, the
    engine and its exact build, the docker image, the model file and size, launch and
    env flags. **Memory bandwidth** is measured with random data inside the server's
-   container. Zeros compress on Arc and read about 3× too high.
+   container. Zeros compress on Arc and read about 3× too high. **Max context:** the
+   longest context the configuration holds in memory (from vLLM's log, estimated for
+   llama.cpp).
 4. **BetterBench:** single-stream decode per category, a prefill sweep and a
-   concurrency sweep. GPU power, energy and clock are sampled throughout.
+   concurrency sweep. GPU power, energy, core and memory clock are sampled throughout.
 5. **Summary:** decode t/s, TTFT, concurrency and prefill throughput, % of memory
-   bandwidth reached, average power and clock, and energy: J per token for decode and
+   bandwidth reached, average power and clocks, and energy: J per token for decode and
    each concurrency level, J per 1000 tokens for prefill.
 
 Everything is recorded as notes in the results `.json`, so it shows in the report and in
 `compare`. Example notes:
 
 ```
-gpu          1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395
+gpu          1x Intel Arc Pro B65 · 32 GB · driver 1.17.39395 · max 2800 MHz core
 pcie         Gen4 x16 · ReBAR on
 engine       llama.cpp b11913-7aca0d2ea · 4 slots · image ghcr.io/ggml-org/llama.cpp:server-intel@1a2b3c4d5e6f
 model_file   /models/Qwen3.8-27B-UD-Q4_K_M.gguf · 16.46 GB · standard: Qwen3.8-27B UD-Q4_K_M
 launch       b 4096 · ub 1024 · fa on · ctk q8_0 · ctv q8_0 · ngl 99 · np 4
+max_ctx      ≈ 181k tokens est. · 33k set · 9.1 GB free · 34 KiB/token
 env_flags    GGML_SYCL_DISABLE_OPT=0 · ZES_ENABLE_SYSMAN=1
 mem_bw       532 GB/s measured (torch copy, random, 1024 MiB) · 608 GB/s declared
 greedy_check identical 3/3 · 1d5105fe09dc
 thinking     default · reasoning seen
-run          full · concurrency on · bench-standard 0.5.0 · betterbench 0.6.1
+run          full · concurrency on · bench-standard 0.6.0 · betterbench 0.6.1
 ```
 
 ## Your result

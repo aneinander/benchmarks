@@ -104,3 +104,32 @@ def test_run_note_betterbench_build(tmp_path):
     assert notes["run"] == "full · concurrency on · bench-standard 0.4.1 · betterbench 0.6.1"
     notes, _, _ = run(tmp_path, m={"betterbench_build": "v0.6.1-3-gabc1234-dirty"})
     assert notes["run"].endswith("betterbench 0.6.1 @ v0.6.1-3-gabc1234-dirty")
+
+
+def test_gpu_note_clocks(tmp_path):
+    notes, _, _ = run(tmp_path, c={"gpu_vram_gb": "32", "gpu_max_core_mhz": "2800",
+                                   "gpu_max_mem_mhz": "19000"})
+    assert notes["gpu"] == "1x Intel Arc Pro B65 · 32 GB · max 2800 MHz core · 19000 MHz mem"
+
+
+def test_max_ctx_vllm_from_engine_log(tmp_path):
+    notes, _, _ = run(tmp_path, cmd=VLLM_CMD, m={"kv": "int8_k_int4_v"},
+                      c={"engine": "vllm", "ctx": "262144", "kv_cache_tokens": "412416"})
+    assert notes["max_ctx"] == "412k tokens (engine KV cache) · 262k set"
+
+
+def test_max_ctx_llama_estimate(tmp_path):
+    # 4 GiB free; q8_0 K and V, 16384 elements each per token = 34816 bytes
+    c = {"ctx": "32768", "kv_elems_per_token": "16384 16384 8192 8192",
+         "gpu_vram_total_mib": "32768", "gpu_vram_used_mib": "28672"}
+    notes, _, _ = run(tmp_path, c=c)
+    est = 32768 + 4 * 2**30 // 34816
+    assert notes["max_ctx"] == f"≈ {est / 1000:.0f}k tokens est. · 33k set · 4.3 GB free · 34 KiB/token"
+    # --swa-full keeps the sliding-window layers at full size too
+    notes, _, _ = run(tmp_path, cmd=LLAMA_CMD + " --swa-full", c=c)
+    assert notes["max_ctx"].endswith("51 KiB/token")
+
+
+def test_max_ctx_left_out_without_data(tmp_path):
+    notes, _, _ = run(tmp_path)
+    assert "max_ctx" not in notes
