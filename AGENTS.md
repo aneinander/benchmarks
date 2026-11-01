@@ -26,8 +26,12 @@ one makes the run fail. Correct is more important than fast.
 ## Models
 
 Results only count for the files in the [README's model table](README.md#models).
-Check the served file's SHA256 against it, with the commands below the table. On a
-mismatch, tell your human before benchmarking. `--quant` for each model is in that table.
+`bench.sh` hashes the served file when it can find it on this machine (the `model_file`
+note in the dry run shows `sha256 ... (standard: NAME)`), and warns when it isn't a
+standard model or `--quant` doesn't match. When the note has no hash (BetterBench on
+another machine, weights it can't locate), check the SHA256 yourself with the commands
+below the table. On a mismatch, tell your human before benchmarking. `--quant` for each
+model is in that table.
 
 ## Procedure
 
@@ -75,6 +79,10 @@ with your human:
 | `--thinking` | `--reasoning-budget 0` or `enable_thinking: false` in the template kwargs → `off`; unclear → ask | `enable_thinking`/effort in the chat template or default kwargs; nothing set → `default`; unclear → ask |
 | `--submitter` | ask | ask |
 
+`bench.sh` checks `--kv`, `--spec`, `--thinking` (and `--tp`/`--pp` for vLLM) against the
+launch command and warns `--X A but the launch command sets ...: declare --X B`. Don't
+just switch to B: show your human the warning and confirm.
+
 ### 5. Dry run
 
 ```sh
@@ -85,7 +93,8 @@ with your human:
 This sends the warm-up and the greedy check, detects everything, prints what it would
 run, and stops. Check the `--note` values in that output:
 - `unknown` values should have a reason (VM PCIe, no cmd file, ...).
-- Any `bench.sh: warning:` line needs fixing or explaining before the real run.
+- Any `bench.sh: warning:` line needs fixing or explaining before the real run. The dry
+  run repeats them all at the end.
 
 ### 6. Quick run, then full run
 
@@ -99,7 +108,9 @@ background job, so a dropped session doesn't kill the benchmark.
 Tell your human:
 - the result folder (printed after `done:`)
 - the summary block: decode t/s, TTFT, concurrency, prefill, bandwidth %, power, energy
-- every warning, and whether the greedy check was `identical`
+  (also in `summary.txt` in the folder)
+- every warning (listed at the end of the summary), and whether the greedy check was
+  `identical`
 - that the folder is what they send in, and that they should check `server-cmd.txt` for
   anything private first (tokens, keys and passwords are already redacted)
 
@@ -111,12 +122,16 @@ Tell your human:
 | `warm-up request failed (HTTP ...)` | server not up, or wrong `--endpoint`/`--model` (step 2). Behind llama-swap the first load can take minutes; `WARM_TIMEOUT=1800` gives it longer |
 | `missing mandatory value(s)` | pass the listed flags (step 4) |
 | `GPU power limit not detected here` | ask for the limit, pass `--power-limit W` or `stock` |
-| `--kv X but the launch command sets Y` | the declared `--kv` is wrong. Use what the command sets |
+| `--X A but the launch command sets ...: declare --X B` | the declared value contradicts the launch command. Confirm with your human, then use B |
+| `not one of the standard models` | the served file's hash isn't in the README's table: wrong file or quant. Tell your human |
+| `--quant X but the model file is NAME` | use the `--quant` the table lists for that file |
+| `greedy check failed (...)` | the server rejected or timed out the temperature-0 requests; read the error |
 | `greedy_check=differs` | not a failure, but report it. It means nondeterministic kernels or a broken spec-decoding path |
 | `--thinking X, but the greedy replies ...` | the declared thinking mode doesn't match what the server does. Ask your human which is right; never change the server yourself |
 | `mem_bw` has no measured figure | no torch in the server container. Set `BW_PYTHON` to a python with GPU torch, or install `clpeak`, or leave it |
 | `launch=unknown (pass --server-cmd-file)` | step 3 |
 | `betterbench failed (exit N)` | read `betterbench.log` in the `.failed` folder. Usually the server crashed or ran out of memory |
+| `interrupted; partial output in ....interrupted` | the run was stopped (Ctrl-C, kill, dropped session). It doesn't count; run again |
 | `ReBAR ... but BetterBench reads ...` | BetterBench runs on another machine than the GPU. Use `--env-file` (below) |
 
 **BetterBench on another machine than the GPU:** run

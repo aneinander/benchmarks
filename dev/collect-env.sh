@@ -10,7 +10,8 @@
 #   --server-cmd-out  behind llama-swap: write the model's launch command (raw) to FILE
 #   --server-cmd-file the launch command when not behind llama-swap (finds the container)
 # env: BETTERBENCH_API_KEY, PROBE_TIMEOUT (s, default 10), LOAD_TIMEOUT (s, default 600),
-#      MEASURE_BW=0 (skip the bandwidth test), BW_PYTHON (python with torch for it)
+#      MEASURE_BW=0 (skip the bandwidth test), BW_PYTHON (python with torch for it),
+#      HASH_MODEL=0 (skip hashing the model file; hashes are cached by size and mtime)
 
 set -u
 LC_ALL=C; export LC_ALL
@@ -27,13 +28,15 @@ while [ $# -gt 0 ]; do
     --api-key)        need $# "$1"; api_key=$2; shift 2 ;;
     --server-cmd-out) need $# "$1"; cmd_out=$2; shift 2 ;;
     --server-cmd-file) need $# "$1"; cmd_file=$2; shift 2 ;;
-    -h|--help)        sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "collect-env: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 tmp=$(mktemp -d) || exit 1
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Header via a file so the key never shows up in `ps`.
 if [ -n "$api_key" ]; then printf 'Authorization: Bearer %s\n' "$api_key" > "$tmp/hdr"
 else printf 'Accept: application/json\n' > "$tmp/hdr"; fi
@@ -104,6 +107,44 @@ pcie_of() {
   fi
   [ -n "$g" ] && [ -n "$w" ] && pcie_max="Gen$g x$w"
   return 0
+}
+
+# hostpath PATH - the host path behind a path inside the server's container,
+# from the -v / --mount flags of the launch command in $tmp/cmd; prints
+# nothing when no bind mount covers it.
+hostpath() {
+  [ -s "$tmp/cmd" ] && have python3 || return 0
+  python3 - "$tmp/cmd" "$1" <<'PY' 2>/dev/null
+import os, re, sys
+cmd, path = open(sys.argv[1], encoding="utf-8", errors="replace").read(), sys.argv[2]
+maps = re.findall(r'(?:^|\s)(?:-v|--volume)[ =](\S+?):(/[^\s:]*)', cmd)
+for m in re.finditer(r'--mount[ =](\S+)', cmd):
+    o = dict(p.split("=", 1) for p in m.group(1).split(",") if "=" in p)
+    src, dst = o.get("source") or o.get("src"), o.get("target") or o.get("destination") or o.get("dst")
+    if src and dst:
+        maps.append((src, dst))
+best = None
+for src, dst in maps:
+    dst = dst.rstrip("/") or "/"
+    src = os.path.expandvars(os.path.expanduser(src.strip("'\"")))
+    if src.startswith("/") and (path == dst or path.startswith(dst.rstrip("/") + "/")):
+        if best is None or len(dst) > len(best[1]):     # the innermost mount wins
+            best = (src, dst)
+if best:
+    print(best[0].rstrip("/") + path[len(best[1].rstrip("/")):])
+PY
+}
+
+# hf_snapshot HF_HOME REPO_ID - the snapshot dir of a Hugging Face cache entry
+hf_snapshot() {
+  r="$1/hub/models--$(printf '%s' "$2" | sed 's|/|--|g')"
+  [ -d "$r/snapshots" ] || return 1
+  if [ -f "$r/refs/main" ] && [ -d "$r/snapshots/$(cat "$r/refs/main")" ]; then
+    printf '%s\n' "$r/snapshots/$(cat "$r/refs/main")"
+  else
+    set -- "$r"/snapshots/*/
+    [ $# = 1 ] && [ -d "$1" ] && printf '%s\n' "${1%/}"
+  fi
 }
 
 # ---------------------------------------------------------------- GPU
@@ -188,6 +229,7 @@ os=$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}") )
 kernel=$(uname -r 2>/dev/null)
 
 # ---------------------------------------------------------------- engine
+[ -n "$cmd_file" ] && cp "$cmd_file" "$tmp/cmd" 2>/dev/null
 proxy=none engine=unknown engine_version="" model_file="" ctx="" engine_slots=""
 if [ -n "$endpoint" ]; then
   base=${endpoint%/}; base=${base%/v1}
@@ -227,43 +269,77 @@ if [ -n "$endpoint" ]; then
     fi
   fi
 
-  # Behind llama-swap the launch command is known: keep it, and map a
-  # container path (-v HOST:/model) back to the host path.
+  # Behind llama-swap the launch command is known: keep it (it wins over
+  # --server-cmd-file for finding the container and the mounts).
   if [ "$proxy" = llama-swap ] && [ -n "$model" ] && fetch "$base/running" "$tmp/running"; then
     export JARG="$model"
-    jget "$tmp/running" 'next((r.get("cmd") for r in j["running"] if r.get("model") == arg), "")' > "$tmp/cmd"
-    if [ -s "$tmp/cmd" ]; then
+    jget "$tmp/running" 'next((r.get("cmd") for r in j["running"] if r.get("model") == arg), "")' > "$tmp/cmd.swap"
+    if [ -s "$tmp/cmd.swap" ]; then
+      mv "$tmp/cmd.swap" "$tmp/cmd"
       [ -n "$cmd_out" ] && cp "$tmp/cmd" "$cmd_out"
-      if [ -n "$model_file" ] && have python3; then
-        host=$(python3 - "$tmp/cmd" "$model_file" <<'PY' 2>/dev/null
-import re, sys
-cmd, path = open(sys.argv[1]).read(), sys.argv[2]
-for src, dst in re.findall(r'(?:-v|--volume)[ =](\S+?):(/[^\s:]*)', cmd):
-    if path == dst or path.startswith(dst.rstrip("/") + "/"):
-        print(src + path[len(dst):]); break
-PY
-)
-        [ -n "$host" ] && model_file=$host
-      fi
     fi
   fi
 fi
 
-# Weight bytes as stored: a single file, the parts of a split GGUF
-# (-00001-of-0000N.gguf), or the *.safetensors of a model directory.
-model_bytes=""
-if [ -f "$model_file" ]; then
-  case $model_file in
-    *-00001-of-[0-9]*.gguf) set -- "${model_file%-00001-of-*}"-[0-9]*-of-[0-9]*.gguf ;;
-    *) set -- "$model_file" ;;
+# model_path: where the weights are on this machine. The engine reports its
+# own view: a path inside its container (mapped back through -v / --mount),
+# or, for vLLM, often a Hugging Face repo id (looked up in the HF cache, the
+# container's and this machine's).
+model_path=""
+if [ -n "$model_file" ]; then
+  model_path=$(hostpath "$model_file")
+  [ -n "$model_path" ] && [ -e "$model_path" ] || model_path=$model_file
+  case $model_path in
+    /*|.*) ;;
+    */*) if [ ! -e "$model_path" ]; then
+           cenv=$( [ -s "$tmp/cmd" ] && tr '\n' ' ' < "$tmp/cmd" | sed -n 's/.*[ =]HF_HOME=\([^ ]*\).*/\1/p')
+           for root in $(hostpath "${cenv:-/root/.cache/huggingface}") $cenv \
+                       "${HF_HOME:-$HOME/.cache/huggingface}"; do
+             snap=$(hf_snapshot "$root" "$model_file") && { model_path=$snap; break; }
+           done
+         fi ;;
   esac
-  model_bytes=$(stat -c %s "$@" 2>/dev/null | awk '{s += $1} END {if (s) printf "%d", s}')
-elif [ -d "$model_file" ]; then
-  model_bytes=$(find "$model_file" -maxdepth 1 -name '*.safetensors' -exec stat -c %s {} + 2>/dev/null |
-                awk '{s += $1} END {if (s) printf "%d", s}')
+  [ -e "$model_path" ] || model_path=""
 fi
 
-[ -s "$tmp/cmd" ] || { [ -n "$cmd_file" ] && cp "$cmd_file" "$tmp/cmd" 2>/dev/null; }
+# Weight bytes as stored: a single file, the parts of a split GGUF
+# (-00001-of-0000N.gguf), or the *.safetensors of a model directory. stat -L:
+# the HF cache keeps files as symlinks into blobs/.
+model_bytes="" model_sha256=""
+set --
+if [ -f "$model_path" ]; then
+  case $model_path in
+    *-00001-of-[0-9]*.gguf) set -- "${model_path%-00001-of-*}"-[0-9]*-of-[0-9]*.gguf ;;
+    *) set -- "$model_path" ;;
+  esac
+elif [ -d "$model_path" ]; then
+  set -- "$model_path"/*.safetensors
+  [ -e "$1" ] || set --
+fi
+[ $# -gt 0 ] && model_bytes=$(stat -L -c %s "$@" 2>/dev/null | awk '{s += $1} END {if (s) printf "%d", s}')
+
+# The hash the README's model table lists: sha256 of the GGUF, or of a repo's
+# per-file *.safetensors hashes in name order. Split GGUFs aren't hashed.
+# Cached by path, size and mtime, since hashing 15 GB takes a while.
+case $model_path in *-00001-of-[0-9]*.gguf) split=1 ;; *) split=0 ;; esac
+if [ "${HASH_MODEL:-1}" != 0 ] && [ -n "$model_bytes" ] && [ $split = 0 ] && have sha256sum; then
+  sig=$(stat -L -c '%n %s %Y' "$@" 2>/dev/null | cksum | cut -d' ' -f1)
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/bench-standard/model-sha256"
+  model_sha256=$(awk -v s="$sig" -v p="$model_path" -F '\t' '$1 == s && $2 == p {print $3; exit}' "$cache" 2>/dev/null)
+  if [ -z "$model_sha256" ]; then
+    echo "collect-env: hashing $model_path ($((model_bytes / 1000000000)) GB; once, it's cached; HASH_MODEL=0 skips) ..." >&2
+    if [ -f "$model_path" ]; then
+      model_sha256=$(sha256sum "$model_path" | cut -c1-64)
+    else
+      model_sha256=$(cd "$model_path" && sha256sum -- *.safetensors | sort -k2 | sha256sum | cut -c1-64)
+    fi
+    case $model_sha256 in
+      [0-9a-f]*) mkdir -p "${cache%/*}" 2>/dev/null &&
+                 printf '%s\t%s\t%s\n' "$sig" "$model_path" "$model_sha256" >> "$cache" 2>/dev/null ;;
+      *) model_sha256="" ;;
+    esac
+  fi
+fi
 # A docker server: the exact image, since tags like llama.cpp's server-intel
 # move daily (the llama.cpp build itself is in engine_version).
 container="" engine_image=""
@@ -288,6 +364,7 @@ if [ "${MEASURE_BW:-1}" != 0 ]; then
   else
     r=""
   fi
+  case $r in [0-9]*' '[0-9]*) ;; *) r="" ;; esac   # "GBPS MIB", or nothing usable
   if [ -n "$r" ]; then
     gpu_mem_bw_gbs=${r% *} gpu_mem_bw_tool="torch copy, random, ${r#* } MiB"
   elif have clpeak && [ -n "$gpu_model" ]; then
@@ -328,6 +405,8 @@ kv engine_version "$engine_version"
 kv engine_slots "$engine_slots"
 kv engine_image "$engine_image"
 kv model_file "$model_file"
+kv model_path "$model_path"
 kv model_bytes "$model_bytes"
+kv model_sha256 "$model_sha256"
 kv ctx "$ctx"
 exit 0

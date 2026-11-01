@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""A fake betterbench for dev/test.sh: writes a plausible results.json.
+FAKE_BB_SLEEP=S sleeps S seconds first; FAKE_BB_FAIL=N exits N."""
+import json, os, sys, time
+a = sys.argv[1:]
+if a[:1] == ["--version"]:
+    print("betterbench " + os.environ.get("FAKE_BB_VERSION", "0.6.1")); sys.exit()
+print("[1/3] single stream"); sys.stdout.flush()
+time.sleep(float(os.environ.get("FAKE_BB_SLEEP", "0")))
+if os.environ.get("FAKE_BB_FAIL"):
+    print("Traceback: boom"); sys.exit(int(os.environ["FAKE_BB_FAIL"]))
+out = a[a.index("--out") + 1]
+rec = [{"ok": True, "completion_tokens": 256, "decode_tps": 50.0 + i, "ttft_ms": 120 + i} for i in range(5)]
+res = {"single_stream": {"code": rec},
+       "concurrency": [{"level": 1, "aggregate_tps": 50, "wall_s": 10},
+                       {"level": 4, "aggregate_tps": 160, "wall_s": 10}],
+       "prefill": [{"target_depth": 4000, "pp_tps": [1500, 1600]}, {"target_depth": 64000, "skipped": True}],
+       "env": {}, "argv": a}
+json.dump(res, open(out, "w"))
+open(out.replace(".json", ".html"), "w").write("<html></html>")
+print("[3/3] done")
