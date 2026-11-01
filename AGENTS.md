@@ -11,9 +11,21 @@ one makes the run fail. Correct is more important than fast.
 ## Rules
 
 - **Ask in the three rounds below**, not one question at a time: round 1 before you
-  start, round 2 after detecting, round 3 before `--full`. Number the questions so your
-  human can answer `1: pascal, 2: yes, ...`, and fill in what you already know as a
-  default they only have to confirm. "Don't know, find it" is always a valid answer.
+  start, round 2 after detecting, round 3 before `--full`. A round is one batch,
+  asked before you do anything else, never spread across turns. Number the questions,
+  and fill in what you already know as a default they only have to confirm. "Don't
+  know, find it" is always a valid answer.
+  - **With a question tool** (e.g. `ask_user_question` in Pi, `AskUserQuestion` in
+    Claude Code), use it for each round. If a round has more questions than one call
+    allows, split it into consecutive calls of the tool's maximum, in the original
+    order, and keep the numbers: with 4 per call, round 1 is 1-4, 5-8, 9-10. Make the
+    bracketed default the first option, marked as recommended. Leave the free-text
+    answer ("Other") open for anything that needs typing: a name, a URL, a launch
+    command, watts. A free-text question (1, 3, 5) has no real choices, so give it the
+    default and "find it" as options.
+  - **Without one,** ask in one numbered message, answered as `1: pascal, 2: yes, ...`.
+  - **Round 2's table is always a plain message**, so it stays readable. Only its
+    confirmation ("ok", or correct line N) may go through the tool.
 - **Run benchmarks only through `./bench.sh`.** Never call `betterbench run` directly,
   and never add BetterBench flags. `bench.sh` refuses them.
 - **Don't edit `bench.sh`** to make a run pass. If it seems wrong, tell your human.
@@ -42,7 +54,9 @@ model is in that table.
 
 ### 1. Round 1: the setup questions
 
-Ask these in one message, before running anything. Put the default in brackets.
+Ask these as one batch before running anything: with a question tool, in calls of its
+maximum (1-4, 5-8, 9-10 with 4 per call); without one, in one message like this. Put the
+default in brackets.
 
 ```text
 Before I start, a few questions. Answer by number; "find it" is fine for any of them.
