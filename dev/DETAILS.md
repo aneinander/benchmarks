@@ -151,3 +151,7 @@ BetterBench 0.6.1 is the oldest version that works (`BETTERBENCH_MIN_VERSION` in
 `standard.env`). Newer ones run too, and their version goes into the `run` note.
 Bump `STANDARD_VERSION` when `config.json`, the minimum BetterBench or the recorded
 fields change.
+
+`report-header.py` tidies the header of `results.html` after the run: it changes only how the
+badges are shown, not what is recorded, so it needs no version bump. If it cannot read the page
+it warns and leaves the report as BetterBench wrote it.

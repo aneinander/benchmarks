@@ -66,6 +66,35 @@ bench "$LL" "$t/cmd1"; rc=$?
 run=$(sed -n 's/^done: //p' "$t/out")
 check "quick run finishes (no GPU, the sampler exits at once)" '[ $rc = 0 ] && [ -d "$run" ]'
 check "run folder has every file" 'for f in results.json results.html meta.json config.json server-cmd.txt summary.txt betterbench.log; do [ -s "$run/$f" ] || exit 1; done'
+# the report header: fewer badges, nothing lost from the rest of the page
+h="$run/results.html"
+check "report header tidied without a warning" '! grep -q "report header not tidied" "$t/out" && grep -q "the numbers" "$h"'
+check "model badge has name and size, no path or hash" 'grep -q "Model: test.gguf · 0.00 GB</span>" "$h" && ! grep -q "model_file:" "$h" && ! grep -q "sha256" "$h"'
+check "pcie and power limit joined the gpu badge" 'grep -q "PCIe [^<]*· 200 W limit</span>" "$h" && ! grep -q "power_limit:" "$h"'
+check "corpus, passes, temp and cache joined the run badge" 'grep -q "run: [^<]*· corpus v1.0 · 5 passes/cat · temp 0.7 · cold prefix cache (nonce)</span>" "$h"'
+check "endpoint badge removed" '! grep -q "<code>http" "$h"'
+check "flags are a dropdown with the redacted command" 'grep -q "<summary>Deploy command</summary>" "$h" && grep -q "HF_TOKEN=&lt;redacted&gt;" "$h" && ! grep -q "launch: " "$h" && ! grep -q "env_flags: " "$h"'
+# rh NAME MODEL_FILE [server-cmd.txt text]: the script alone on a one-badge-of-each page
+rh() {
+  mkdir -p "$t/rh/$1"; rm -f "$t/rh/$1/server-cmd.txt"
+  printf '<style></style><header><h1>m</h1><div class="runbar"><span class="chip">m</span><span class="chip">gpu: g</span><span class="chip">run: r</span><span class="chip">model_file: %s</span><span class="chip">launch: x 1</span><span class="chip">env_flags: A=1</span></div>\n</header>' "$2" > "$t/rh/$1/results.html"
+  [ $# -gt 2 ] && printf '%s' "$3" > "$t/rh/$1/server-cmd.txt"
+  BENCH_MODEL_LIBRARY="$t/lib" python3 "$dev/report-header.py" "$t/rh/$1"
+}
+mkdir -p "$t/lib/SomeOrg/Local"
+rh repo "Org/Repo · 3.00 GB · sha256 abc (standard: Q4)"
+check "report: a repo id keeps its org" 'grep -q "Model: Org/Repo · 3.00 GB</span>" "$t/rh/repo/results.html"'
+rh lib "/model · 1.00 GB" "docker run -v /any/folder/Local:/model:ro img /model"
+check "report: a mounted model gets its org from the library" 'grep -q "Model: SomeOrg/Local · 1.00 GB</span>" "$t/rh/lib/results.html"'
+rh nofile "1.00 GB"
+check "report: no command falls back to the flags" 'grep -q "<dt>A</dt><dd>1</dd>" "$t/rh/nofile/results.html" && grep -q "Model: m · 1.00 GB</span>" "$t/rh/nofile/results.html"'
+rh wrap "/m" "$(printf 'srv \\\n  --a 1 \\\n  --b=2')"
+check "report: a wrapped command is not wrapped twice" '[ "$(grep -c "\\\\$" "$t/rh/wrap/results.html")" = 2 ]'
+rh script "/m" "$(printf 'a: 1\nb: 2')"
+check "report: not one command, shown as written" 'grep -q "<pre>a: 1$" "$t/rh/script/results.html"'
+printf '<html></html>' > "$t/rh/nofile/results.html"
+check "report: an unknown page fails and stays as it was" '! python3 "$dev/report-header.py" "$t/rh/nofile" 2>/dev/null && [ "$(cat "$t/rh/nofile/results.html")" = "<html></html>" ]'
+
 check "no empty power.csv without a GPU" '[ ! -e "$run/power.csv" ]'
 check "summary printed" 'grep -q "decode (batch 1)  52.0 t/s" "$t/out"'
 check "meta.json has post-run figures and warnings" 'python3 -c "import json,sys; m=json.load(open(sys.argv[1])); assert \"post_run\" in m and \"warnings\" in m" "$run/meta.json"'

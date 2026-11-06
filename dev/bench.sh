@@ -793,6 +793,9 @@ elif rebar != "unknown" and mine.get("resizable_bar", "").split()[-1:] != [rebar
     print("bench.sh: warning: " + msg, file=sys.stderr)
     open(os.environ["WARNINGS"], "a", encoding="utf-8").write(msg + "\n")
 PY
+# Fewer badges in the report header; results.json and meta.json keep every value.
+python3 "$here/report-header.py" "$run_dir" || warn "report header not tidied, results.html is as BetterBench wrote it"
+
 # Energy per token and decode as % of memory bandwidth, from what the run
 # measured. They come after the run, so they go to meta.json ("post_run"),
 # not into the notes of results.json.

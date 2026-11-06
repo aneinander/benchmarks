@@ -230,7 +230,7 @@ Each run makes a folder `results/<date>-<you>-<model>-<engine>-<gpu>/`:
 
 | file | what |
 |---|---|
-| `results.html` | the report; open it in a browser |
+| `results.html` | the report; open it in a browser. Launch command in a dropdown; `results.json` and `meta.json` keep every value |
 | `results.json` | the results, with all notes |
 | `meta.json` | every raw value, plus energy, % of bandwidth and the warnings |
 | `summary.txt` | the summary printed at the end |

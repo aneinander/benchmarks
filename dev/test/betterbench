@@ -17,5 +17,14 @@ res = {"single_stream": {"code": rec},
        "prefill": [{"target_depth": 4000, "pp_tps": [1500, 1600]}, {"target_depth": 64000, "skipped": True}],
        "env": {}, "argv": a}
 json.dump(res, open(out, "w"))
-open(out.replace(".json", ".html"), "w").write("<html></html>")
+# The header as BetterBench renders it, for report-header.py
+model = a[a.index("--model") + 1]
+sw = '<span class="swatch"></span>'
+chips = [sw + model, f'<code>{a[a.index("--endpoint") + 1]}</code>', "corpus v1.0", "5 passes/cat", "temp 0.7",
+         "cold prefix cache (nonce)", "8,192 tok context"]
+chips += [sw + n.replace("=", ": ", 1) for i, n in enumerate(a) if i and a[i - 1] == "--note"]
+bar = "".join(f'<span class="chip">{c}</span>' for c in chips)
+open(out.replace(".json", ".html"), "w").write(
+    f'<html><style>a{{}}</style><body><header><h1>{model}</h1>\n<div class="runbar">{bar}</div>\n</header>'
+    '<main>the numbers</main></body></html>')
 print("[3/3] done")
